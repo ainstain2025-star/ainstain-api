@@ -1,14 +1,3 @@
 {
-  "version": 2,
-  "functions": {
-    "api/chat.py": {
-      "runtime": "python3.9"
-    }
-  },
-  "routes": [
-    {
-      "src": "/api/chat",
-      "dest": "/api/chat.py"
-    }
-  ]
+  "version": 2
 }
