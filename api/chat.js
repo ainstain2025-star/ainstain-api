@@ -28,19 +28,24 @@ function extractSearchQuery(messages) {
   return clean.slice(0, 200);
 }
 
-async function braveSearch(query, apiKey) {
-  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&search_lang=it&country=IT`;
-  const res = await fetch(url, {
+async function tavilySearch(query, apiKey) {
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
     headers: {
-      'Accept': 'application/json',
-      'Accept-Encoding': 'gzip',
-      'X-Subscription-Token': apiKey,
+      'Content-Type': 'application/json',
     },
+    body: JSON.stringify({
+      api_key: apiKey,
+      query,
+      search_depth: 'basic',
+      max_results: 5,
+      include_answer: false,
+    }),
   });
-  if (!res.ok) throw new Error(`Brave Search error: ${res.status}`);
+  if (!res.ok) throw new Error(`Tavily Search error: ${res.status}`);
   const data = await res.json();
-  const results = data.web?.results || [];
-  return results.map(r => `- ${r.title}: ${r.description || ''} (${r.url})`).join('\n');
+  const results = data.results || [];
+  return results.map(r => `- ${r.title}: ${r.content || ''} (${r.url})`).join('\n');
 }
 
 export default async function handler(req) {
@@ -77,8 +82,8 @@ export default async function handler(req) {
     );
   }
 
-  const groqKey  = process.env.GROQ_API_KEY;
-  const braveKey = process.env.BRAVE_API_KEY;
+  const groqKey   = process.env.GROQ_API_KEY;
+  const tavilyKey = process.env.TAVILY_API_KEY;
 
   if (!groqKey) {
     return new Response(
@@ -87,21 +92,21 @@ export default async function handler(req) {
     );
   }
 
-  // ── Web Search ────────────────────────────────────────────────────────
+  // ── Web Search (Tavily) ───────────────────────────────────────────────
   let webContext = '';
-  const shouldSearch = braveKey && (forceWebSearch || needsWebSearch(messages));
+  const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
 
   if (shouldSearch) {
     try {
       const query   = extractSearchQuery(messages);
-      const results = await braveSearch(query, braveKey);
+      const results = await tavilySearch(query, tavilyKey);
       if (results) {
         const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
         webContext = `\n\n[RISULTATI WEB AGGIORNATI - ${today}]\nHo cercato in rete informazioni su: "${query}". Ecco i risultati trovati:\n${results}\n[Fine risultati web]\n\nUsa queste informazioni aggiornate per rispondere. Cita la fonte quando utile.`;
       }
     } catch (err) {
       // Se la ricerca fallisce, procedi senza — non bloccare la risposta
-      console.error('Brave search failed:', err.message);
+      console.error('Tavily search failed:', err.message);
     }
   }
 
