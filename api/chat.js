@@ -2,7 +2,6 @@ export const config = {
   runtime: 'edge',
 };
 
-// ── Parole chiave che suggeriscono necessità di info aggiornate ──────────
 const WEB_SEARCH_TRIGGERS = [
   /\b(oggi|adesso|ora|attuale|attualmente|recente|recentemente|ultimo|ultimi|ultime|notizie|news)\b/i,
   /\b(2024|2025|2026)\b/,
@@ -12,18 +11,29 @@ const WEB_SEARCH_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione)\b/i,
 ];
 
+// Estrae testo da un content che può essere stringa o array multimodale
+function extractText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(c => c.type === 'text')
+      .map(c => c.text || '')
+      .join(' ');
+  }
+  return '';
+}
+
 function needsWebSearch(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return false;
-  const text = typeof lastUser.content === 'string' ? lastUser.content : '';
+  const text = extractText(lastUser.content);
   return WEB_SEARCH_TRIGGERS.some(re => re.test(text));
 }
 
 function extractSearchQuery(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return '';
-  const text = typeof lastUser.content === 'string' ? lastUser.content : '';
-  // Rimuovi parti del documento iniettato (troppo lungo per cercare)
+  const text = extractText(lastUser.content);
   const clean = text.replace(/---[\s\S]*?---/g, '').trim();
   return clean.slice(0, 200);
 }
@@ -31,9 +41,7 @@ function extractSearchQuery(messages) {
 async function tavilySearch(query, apiKey) {
   const res = await fetch('https://api.tavily.com/search', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       api_key: apiKey,
       query,
@@ -44,8 +52,9 @@ async function tavilySearch(query, apiKey) {
   });
   if (!res.ok) throw new Error(`Tavily Search error: ${res.status}`);
   const data = await res.json();
-  const results = data.results || [];
-  return results.map(r => `- ${r.title}: ${r.content || ''} (${r.url})`).join('\n');
+  return (data.results || [])
+    .map(r => `- ${r.title}: ${r.content || ''} (${r.url})`)
+    .join('\n');
 }
 
 export default async function handler(req) {
@@ -64,7 +73,7 @@ export default async function handler(req) {
 
   let messages, model, forceWebSearch;
   try {
-    const body = JSON.parse(await req.text());
+    const body     = JSON.parse(await req.text());
     messages       = body.messages;
     model          = body.model || 'llama-3.3-70b-versatile';
     forceWebSearch = body.webSearch === true;
@@ -101,11 +110,12 @@ export default async function handler(req) {
       const query   = extractSearchQuery(messages);
       const results = await tavilySearch(query, tavilyKey);
       if (results) {
-        const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
+        const today = new Date().toLocaleDateString('it-IT', {
+          day: '2-digit', month: 'long', year: 'numeric'
+        });
         webContext = `\n\n[RISULTATI WEB AGGIORNATI - ${today}]\nHo cercato in rete informazioni su: "${query}". Ecco i risultati trovati:\n${results}\n[Fine risultati web]\n\nUsa queste informazioni aggiornate per rispondere. Cita la fonte quando utile.`;
       }
     } catch (err) {
-      // Se la ricerca fallisce, procedi senza — non bloccare la risposta
       console.error('Tavily search failed:', err.message);
     }
   }
