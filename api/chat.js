@@ -11,14 +11,10 @@ const WEB_SEARCH_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione)\b/i,
 ];
 
-// Estrae testo da un content che può essere stringa o array multimodale
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    return content
-      .filter(c => c.type === 'text')
-      .map(c => c.text || '')
-      .join(' ');
+    return content.filter(c => c.type === 'text').map(c => c.text || '').join(' ');
   }
   return '';
 }
@@ -34,8 +30,7 @@ function extractSearchQuery(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return '';
   const text = extractText(lastUser.content);
-  const clean = text.replace(/---[\s\S]*?---/g, '').trim();
-  return clean.slice(0, 200);
+  return text.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
 }
 
 async function tavilySearch(query, apiKey) {
@@ -50,7 +45,7 @@ async function tavilySearch(query, apiKey) {
       include_answer: false,
     }),
   });
-  if (!res.ok) throw new Error(`Tavily Search error: ${res.status}`);
+  if (!res.ok) throw new Error(`Tavily error: ${res.status}`);
   const data = await res.json();
   return (data.results || [])
     .map(r => `- ${r.title}: ${r.content || ''} (${r.url})`)
@@ -134,7 +129,7 @@ export default async function handler(req) {
     }
   }
 
-  // ── Chiamata a Groq ───────────────────────────────────────────────────
+  // ── Chiamata a Groq — STREAMING ───────────────────────────────────────
   try {
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -147,25 +142,80 @@ export default async function handler(req) {
         messages: finalMessages,
         max_tokens: 1024,
         temperature: 0.7,
+        stream: true,          // ← STREAMING ABILITATO
       }),
     });
 
-    const responseText = await groqRes.text();
     if (!groqRes.ok) {
+      const errText = await groqRes.text();
       return new Response(
-        JSON.stringify({ error: responseText }),
+        JSON.stringify({ error: errText }),
         { status: groqRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    const data    = JSON.parse(responseText);
-    const content = data.choices[0].message.content;
+    // ── Trasforma lo stream SSE di Groq in un nuovo stream SSE per il client
     const usedWeb = shouldSearch && !!webContext;
 
-    return new Response(
-      JSON.stringify({ message: { role: 'assistant', content }, webSearchUsed: usedWeb }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    // Prima cosa: invia un evento con il flag webSearchUsed
+    // così il frontend sa subito se mostrare il badge web
+    const metaEvent = `data: ${JSON.stringify({ type: 'meta', webSearchUsed: usedWeb })}\n\n`;
+    writer.write(encoder.encode(metaEvent));
+
+    // Poi fa il pipe dei chunk di Groq
+    (async () => {
+      const reader = groqRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // l'ultima riga potrebbe essere incompleta
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === 'data: [DONE]') continue;
+            if (!trimmed.startsWith('data: ')) continue;
+
+            try {
+              const json  = JSON.parse(trimmed.slice(6));
+              const token = json.choices?.[0]?.delta?.content;
+              if (token) {
+                // Ri-emette come SSE con type 'token'
+                const sseChunk = `data: ${JSON.stringify({ type: 'token', token })}\n\n`;
+                writer.write(encoder.encode(sseChunk));
+              }
+              // Fine stream
+              if (json.choices?.[0]?.finish_reason) {
+                writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+              }
+            } catch {}
+          }
+        }
+      } finally {
+        writer.close();
+      }
+    })();
+
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'X-Accel-Buffering': 'no',
+      },
+    });
+
   } catch (e) {
     return new Response(
       JSON.stringify({ error: e.message }),
