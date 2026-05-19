@@ -66,12 +66,16 @@ export default async function handler(req) {
     return new Response('Method not allowed', { status: 405, headers: corsHeaders });
   }
 
-  let messages, model, forceWebSearch;
+  let messages, model, forceWebSearch, tools, toolChoice, temperature, maxTokens;
   try {
     const body     = JSON.parse(await req.text());
     messages       = body.messages;
     model          = body.model || 'llama-3.3-70b-versatile';
     forceWebSearch = body.webSearch === true;
+    tools          = body.tools || null;          // ← NUOVO: tool definitions
+    toolChoice     = body.tool_choice || 'auto';  // ← NUOVO: tool_choice
+    temperature    = body.temperature ?? 0.7;
+    maxTokens      = body.max_tokens || 1024;
   } catch (e) {
     return new Response(
       JSON.stringify({ error: 'Invalid request body: ' + e.message }),
@@ -96,9 +100,9 @@ export default async function handler(req) {
     );
   }
 
-  // ── Web Search (Tavily) ───────────────────────────────────────────────
+  // ── Web Search (Tavily) — solo se non stiamo usando tool calling ──────
   let webContext = '';
-  const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
+  const shouldSearch = !tools && tavilyKey && (forceWebSearch || needsWebSearch(messages));
 
   if (shouldSearch) {
     try {
@@ -129,7 +133,99 @@ export default async function handler(req) {
     }
   }
 
-  // ── Chiamata a Groq — STREAMING ───────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH A: TOOL CALLING (non-streaming, restituisce tool_calls al client)
+  // ══════════════════════════════════════════════════════════════════════
+  if (tools && tools.length > 0) {
+    try {
+      const groqBody = {
+        model,
+        messages: finalMessages,
+        tools,
+        tool_choice: toolChoice,
+        temperature,
+        max_tokens: maxTokens,
+        stream: false,   // tool calling richiede non-streaming
+      };
+
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${groqKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(groqBody),
+      });
+
+      if (!groqRes.ok) {
+        const errText = await groqRes.text();
+        return new Response(
+          JSON.stringify({ error: errText }),
+          { status: groqRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      const data    = await groqRes.json();
+      const choice  = data.choices?.[0];
+      const message = choice?.message;
+
+      // Serializza la risposta come SSE per uniformità con il client
+      const { readable, writable } = new TransformStream();
+      const writer  = writable.getWriter();
+      const encoder = new TextEncoder();
+
+      (async () => {
+        try {
+          // Evento meta
+          writer.write(encoder.encode(
+            `data: ${JSON.stringify({ type: 'meta', webSearchUsed: false })}\n\n`
+          ));
+
+          if (message?.tool_calls && message.tool_calls.length > 0) {
+            // Il modello vuole usare dei tool — restituisci le tool_calls
+            writer.write(encoder.encode(
+              `data: ${JSON.stringify({ type: 'tool_calls', tool_calls: message.tool_calls, content: message.content || null })}\n\n`
+            ));
+          } else {
+            // Risposta testuale normale — tokenizza carattere per carattere per sembrare streaming
+            const text = message?.content || '';
+            for (let i = 0; i < text.length; i += 4) {
+              const chunk = text.slice(i, i + 4);
+              writer.write(encoder.encode(
+                `data: ${JSON.stringify({ type: 'token', token: chunk })}\n\n`
+              ));
+            }
+          }
+
+          writer.write(encoder.encode(
+            `data: ${JSON.stringify({ type: 'done' })}\n\n`
+          ));
+        } finally {
+          writer.close();
+        }
+      })();
+
+      return new Response(readable, {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'X-Accel-Buffering': 'no',
+        },
+      });
+
+    } catch (e) {
+      return new Response(
+        JSON.stringify({ error: e.message }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH B: STREAMING NORMALE (comportamento originale)
+  // ══════════════════════════════════════════════════════════════════════
   try {
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -140,9 +236,9 @@ export default async function handler(req) {
       body: JSON.stringify({
         model,
         messages: finalMessages,
-        max_tokens: 1024,
-        temperature: 0.7,
-        stream: true,          // ← STREAMING ABILITATO
+        max_tokens: maxTokens,
+        temperature,
+        stream: true,
       }),
     });
 
@@ -154,19 +250,15 @@ export default async function handler(req) {
       );
     }
 
-    // ── Trasforma lo stream SSE di Groq in un nuovo stream SSE per il client
     const usedWeb = shouldSearch && !!webContext;
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
 
-    // Prima cosa: invia un evento con il flag webSearchUsed
-    // così il frontend sa subito se mostrare il badge web
     const metaEvent = `data: ${JSON.stringify({ type: 'meta', webSearchUsed: usedWeb })}\n\n`;
     writer.write(encoder.encode(metaEvent));
 
-    // Poi fa il pipe dei chunk di Groq
     (async () => {
       const reader = groqRes.body.getReader();
       const decoder = new TextDecoder();
@@ -179,7 +271,7 @@ export default async function handler(req) {
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
-          buffer = lines.pop(); // l'ultima riga potrebbe essere incompleta
+          buffer = lines.pop();
 
           for (const line of lines) {
             const trimmed = line.trim();
@@ -190,11 +282,9 @@ export default async function handler(req) {
               const json  = JSON.parse(trimmed.slice(6));
               const token = json.choices?.[0]?.delta?.content;
               if (token) {
-                // Ri-emette come SSE con type 'token'
                 const sseChunk = `data: ${JSON.stringify({ type: 'token', token })}\n\n`;
                 writer.write(encoder.encode(sseChunk));
               }
-              // Fine stream
               if (json.choices?.[0]?.finish_reason) {
                 writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
               }
