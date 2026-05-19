@@ -11,11 +11,56 @@ const WEB_SEARCH_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione)\b/i,
 ];
 
+const AGENT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Cerca informazioni aggiornate su internet. Usalo per notizie, persone, eventi recenti, prezzi, meteo, sport.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'La query di ricerca' } },
+        required: ['query']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_current_datetime',
+      description: 'Restituisce la data e ora corrente. Usalo quando chiedono che ore sono o che giorno e.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'calculate',
+      description: 'Esegue calcoli matematici. Usalo per percentuali, operazioni aritmetiche, conversioni.',
+      parameters: {
+        type: 'object',
+        properties: { expression: { type: 'string', description: "L'espressione matematica da calcolare" } },
+        required: ['expression']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remember',
+      description: "Salva un'informazione nella memoria dell'utente.",
+      parameters: {
+        type: 'object',
+        properties: { note: { type: 'string', description: "L'informazione da salvare" } },
+        required: ['note']
+      }
+    }
+  }
+];
+
 function extractText(content) {
   if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.filter(c => c.type === 'text').map(c => c.text || '').join(' ');
-  }
+  if (Array.isArray(content)) return content.filter(c => c.type === 'text').map(c => c.text || '').join(' ');
   return '';
 }
 
@@ -29,27 +74,27 @@ function needsWebSearch(messages) {
 function extractSearchQuery(messages) {
   const lastUser = [...messages].reverse().find(m => m.role === 'user');
   if (!lastUser) return '';
-  const text = extractText(lastUser.content);
-  return text.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
+  return extractText(lastUser.content).replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
 }
 
 async function tavilySearch(query, apiKey) {
   const res = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      api_key: apiKey,
-      query,
-      search_depth: 'basic',
-      max_results: 5,
-      include_answer: false,
-    }),
+    body: JSON.stringify({ api_key: apiKey, query, search_depth: 'basic', max_results: 5, include_answer: false }),
   });
-  if (!res.ok) throw new Error(`Tavily error: ${res.status}`);
+  if (!res.ok) throw new Error('Tavily error: ' + res.status);
   const data = await res.json();
-  return (data.results || [])
-    .map(r => `- ${r.title}: ${r.content || ''} (${r.url})`)
-    .join('\n');
+  return (data.results || []).map(r => '- ' + r.title + ': ' + (r.content || '') + ' (' + r.url + ')').join('\n');
+}
+
+function makeSSEStream(fn) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const send = (obj) => writer.write(encoder.encode('data: ' + JSON.stringify(obj) + '\n\n'));
+  (async () => { try { await fn(send); } finally { writer.close(); } })();
+  return readable;
 }
 
 export default async function handler(req) {
@@ -59,257 +104,122 @@ export default async function handler(req) {
     'Access-Control-Allow-Headers': 'Content-Type',
   };
 
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 200, headers: corsHeaders });
-  }
-  if (req.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405, headers: corsHeaders });
-  }
+  if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: corsHeaders });
+  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: corsHeaders });
 
-  let messages, model, forceWebSearch, tools, toolChoice, temperature, maxTokens;
+  let messages, model, forceWebSearch, useAgentMode, temperature, maxTokens;
   try {
-    const body     = JSON.parse(await req.text());
-    messages       = body.messages;
-    model          = body.model || 'llama-3.3-70b-versatile';
+    const body   = JSON.parse(await req.text());
+    messages     = body.messages;
+    model        = body.model || 'llama-3.3-70b-versatile';
     forceWebSearch = body.webSearch === true;
-    tools          = body.tools || null;          // ← NUOVO: tool definitions
-    toolChoice     = body.tool_choice || 'auto';  // ← NUOVO: tool_choice
-    temperature    = body.temperature ?? 0.7;
-    maxTokens      = body.max_tokens || 1024;
+    useAgentMode = body.agentMode === true;
+    temperature  = body.temperature != null ? body.temperature : 0.7;
+    maxTokens    = body.max_tokens || 1024;
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: 'Invalid request body: ' + e.message }),
-      { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({ error: 'Invalid body: ' + e.message }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 
   if (!messages || !Array.isArray(messages)) {
-    return new Response(
-      JSON.stringify({ error: 'messages array required' }),
-      { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({ error: 'messages array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 
   const groqKey   = process.env.GROQ_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
 
-  if (!groqKey) {
-    return new Response(
-      JSON.stringify({ error: 'GROQ_API_KEY non configurata' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+  if (!groqKey) return new Response(JSON.stringify({ error: 'GROQ_API_KEY mancante' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+
+  const sseHeaders = { ...corsHeaders, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
+
+  // BRANCH A: AGENTE
+  if (useAgentMode) {
+    const readable = makeSSEStream(async (send) => {
+      send({ type: 'meta', webSearchUsed: false });
+      try {
+        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, messages, tools: AGENT_TOOLS, tool_choice: 'auto', temperature, max_tokens: maxTokens, stream: false }),
+        });
+        if (!groqRes.ok) {
+          const err = await groqRes.text();
+          send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
+          return;
+        }
+        const data    = await groqRes.json();
+        const message = data.choices && data.choices[0] && data.choices[0].message;
+        if (!message) { send({ type: 'error', message: 'Nessuna risposta' }); return; }
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          send({ type: 'tool_calls', tool_calls: message.tool_calls, content: message.content || null });
+        } else {
+          const text = message.content || '';
+          for (let i = 0; i < text.length; i += 4) send({ type: 'token', token: text.slice(i, i + 4) });
+        }
+        send({ type: 'done' });
+      } catch (e) {
+        send({ type: 'error', message: e.message });
+      }
+    });
+    return new Response(readable, { status: 200, headers: sseHeaders });
   }
 
-  // ── Web Search (Tavily) — solo se non stiamo usando tool calling ──────
+  // BRANCH B: STREAMING NORMALE
   let webContext = '';
-  const shouldSearch = !tools && tavilyKey && (forceWebSearch || needsWebSearch(messages));
-
+  const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
   if (shouldSearch) {
     try {
       const query   = extractSearchQuery(messages);
       const results = await tavilySearch(query, tavilyKey);
       if (results) {
-        const today = new Date().toLocaleDateString('it-IT', {
-          day: '2-digit', month: 'long', year: 'numeric'
-        });
-        webContext = `\n\n[RISULTATI WEB AGGIORNATI - ${today}]\nHo cercato in rete informazioni su: "${query}". Ecco i risultati trovati:\n${results}\n[Fine risultati web]\n\nUsa queste informazioni aggiornate per rispondere. Cita la fonte quando utile.`;
+        const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
+        webContext = '\n\n[RISULTATI WEB AGGIORNATI - ' + today + ']\nHo cercato: "' + query + '".\n' + results + '\n[Fine risultati web]\n\nUsa queste informazioni per rispondere. Cita la fonte quando utile.';
       }
-    } catch (err) {
-      console.error('Tavily search failed:', err.message);
-    }
+    } catch (err) { console.error('Tavily failed:', err.message); }
   }
 
-  // ── Inietta contesto web nel system prompt ────────────────────────────
   let finalMessages = [...messages];
   if (webContext) {
     const sysIdx = finalMessages.findIndex(m => m.role === 'system');
-    if (sysIdx !== -1) {
-      finalMessages[sysIdx] = {
-        ...finalMessages[sysIdx],
-        content: finalMessages[sysIdx].content + webContext,
-      };
-    } else {
-      finalMessages.unshift({ role: 'system', content: webContext });
-    }
+    if (sysIdx !== -1) finalMessages[sysIdx] = { ...finalMessages[sysIdx], content: finalMessages[sysIdx].content + webContext };
+    else finalMessages.unshift({ role: 'system', content: webContext });
   }
 
-  // ══════════════════════════════════════════════════════════════════════
-  // BRANCH A: TOOL CALLING (non-streaming, restituisce tool_calls al client)
-  // ══════════════════════════════════════════════════════════════════════
-  if (tools && tools.length > 0) {
-    try {
-      const groqBody = {
-        model,
-        messages: finalMessages,
-        tools,
-        tool_choice: toolChoice,
-        temperature,
-        max_tokens: maxTokens,
-        stream: false,   // tool calling richiede non-streaming
-      };
-
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${groqKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(groqBody),
-      });
-
-      if (!groqRes.ok) {
-        const errText = await groqRes.text();
-        return new Response(
-          JSON.stringify({ error: errText }),
-          { status: groqRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-
-      const data    = await groqRes.json();
-      const choice  = data.choices?.[0];
-      const message = choice?.message;
-
-      // Serializza la risposta come SSE per uniformità con il client
-      const { readable, writable } = new TransformStream();
-      const writer  = writable.getWriter();
-      const encoder = new TextEncoder();
-
-      (async () => {
-        try {
-          // Evento meta
-          writer.write(encoder.encode(
-            `data: ${JSON.stringify({ type: 'meta', webSearchUsed: false })}\n\n`
-          ));
-
-          if (message?.tool_calls && message.tool_calls.length > 0) {
-            // Il modello vuole usare dei tool — restituisci le tool_calls
-            writer.write(encoder.encode(
-              `data: ${JSON.stringify({ type: 'tool_calls', tool_calls: message.tool_calls, content: message.content || null })}\n\n`
-            ));
-          } else {
-            // Risposta testuale normale — tokenizza carattere per carattere per sembrare streaming
-            const text = message?.content || '';
-            for (let i = 0; i < text.length; i += 4) {
-              const chunk = text.slice(i, i + 4);
-              writer.write(encoder.encode(
-                `data: ${JSON.stringify({ type: 'token', token: chunk })}\n\n`
-              ));
-            }
-          }
-
-          writer.write(encoder.encode(
-            `data: ${JSON.stringify({ type: 'done' })}\n\n`
-          ));
-        } finally {
-          writer.close();
-        }
-      })();
-
-      return new Response(readable, {
-        status: 200,
-        headers: {
-          ...corsHeaders,
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'X-Accel-Buffering': 'no',
-        },
-      });
-
-    } catch (e) {
-      return new Response(
-        JSON.stringify({ error: e.message }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-  }
-
-  // ══════════════════════════════════════════════════════════════════════
-  // BRANCH B: STREAMING NORMALE (comportamento originale)
-  // ══════════════════════════════════════════════════════════════════════
   try {
     const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${groqKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages: finalMessages,
-        max_tokens: maxTokens,
-        temperature,
-        stream: true,
-      }),
+      headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages: finalMessages, max_tokens: maxTokens, temperature, stream: true }),
     });
-
     if (!groqRes.ok) {
       const errText = await groqRes.text();
-      return new Response(
-        JSON.stringify({ error: errText }),
-        { status: groqRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify({ error: errText }), { status: groqRes.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-
-    const usedWeb = shouldSearch && !!webContext;
-
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    const metaEvent = `data: ${JSON.stringify({ type: 'meta', webSearchUsed: usedWeb })}\n\n`;
-    writer.write(encoder.encode(metaEvent));
-
-    (async () => {
-      const reader = groqRes.body.getReader();
+    const usedWeb  = shouldSearch && !!webContext;
+    const readable = makeSSEStream(async (send) => {
+      send({ type: 'meta', webSearchUsed: usedWeb });
+      const reader  = groqRes.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === 'data: [DONE]') continue;
-            if (!trimmed.startsWith('data: ')) continue;
-
-            try {
-              const json  = JSON.parse(trimmed.slice(6));
-              const token = json.choices?.[0]?.delta?.content;
-              if (token) {
-                const sseChunk = `data: ${JSON.stringify({ type: 'token', token })}\n\n`;
-                writer.write(encoder.encode(sseChunk));
-              }
-              if (json.choices?.[0]?.finish_reason) {
-                writer.write(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
-              }
-            } catch {}
-          }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === 'data: [DONE]' || !trimmed.startsWith('data: ')) continue;
+          try {
+            const json  = JSON.parse(trimmed.slice(6));
+            const token = json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content;
+            if (token) send({ type: 'token', token });
+            if (json.choices && json.choices[0] && json.choices[0].finish_reason) send({ type: 'done' });
+          } catch {}
         }
-      } finally {
-        writer.close();
       }
-    })();
-
-    return new Response(readable, {
-      status: 200,
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no',
-      },
     });
-
+    return new Response(readable, { status: 200, headers: sseHeaders });
   } catch (e) {
-    return new Response(
-      JSON.stringify({ error: e.message }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 }
