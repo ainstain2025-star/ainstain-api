@@ -16,10 +16,10 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'web_search',
-      description: 'Cerca informazioni aggiornate su internet. Usalo per notizie, persone, eventi recenti, prezzi, meteo, sport.',
+      description: 'Cerca informazioni aggiornate su internet. USA SEMPRE questo tool per: notizie, sport, persone famose, eventi recenti, classifiche, risultati, meteo, prezzi. NON rispondere mai dalla memoria su questi argomenti.',
       parameters: {
         type: 'object',
-        properties: { query: { type: 'string', description: 'La query di ricerca' } },
+        properties: { query: { type: 'string', description: 'La query di ricerca specifica' } },
         required: ['query']
       }
     }
@@ -28,7 +28,7 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'get_current_datetime',
-      description: 'Restituisce la data e ora corrente. Usalo quando chiedono che ore sono o che giorno e.',
+      description: 'Restituisce la data e ora corrente. USA SEMPRE questo tool quando chiedono che ore sono, che giorno e, la data di oggi.',
       parameters: { type: 'object', properties: {} }
     }
   },
@@ -36,7 +36,7 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'calculate',
-      description: 'Esegue calcoli matematici. Usalo per percentuali, operazioni aritmetiche, conversioni.',
+      description: 'Esegue calcoli matematici precisi. USA SEMPRE questo tool per percentuali, operazioni aritmetiche, conversioni numeriche.',
       parameters: {
         type: 'object',
         properties: { expression: { type: 'string', description: "L'espressione matematica da calcolare" } },
@@ -48,7 +48,7 @@ const AGENT_TOOLS = [
     type: 'function',
     function: {
       name: 'remember',
-      description: "Salva un'informazione nella memoria dell'utente.",
+      description: "Salva un'informazione nella memoria dell'utente. USA questo tool quando l'utente dice 'ricorda che...' o vuole salvare qualcosa.",
       parameters: {
         type: 'object',
         properties: { note: { type: 'string', description: "L'informazione da salvare" } },
@@ -57,6 +57,17 @@ const AGENT_TOOLS = [
     }
   }
 ];
+
+// System prompt agente — forza l'uso dei tool
+const AGENT_SYSTEM = `Sei AInstAIn, un assistente AI italiano con accesso a tool potenti.
+
+REGOLE FONDAMENTALI:
+1. Per qualsiasi domanda su notizie, sport, persone, eventi, classifiche, risultati, meteo, prezzi → USA SEMPRE web_search. MAI rispondere dalla memoria.
+2. Per domande su data/ora → USA SEMPRE get_current_datetime.
+3. Per calcoli matematici → USA SEMPRE calculate.
+4. Quando l'utente vuole salvare qualcosa → USA remember.
+5. Rispondi SEMPRE in italiano.
+6. Dopo aver usato un tool, usa i risultati per dare una risposta precisa e aggiornata.`;
 
 function extractText(content) {
   if (typeof content === 'string') return content;
@@ -131,24 +142,41 @@ export default async function handler(req) {
 
   const sseHeaders = { ...corsHeaders, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
-  // BRANCH A: AGENTE
+  // BRANCH A: AGENTE con tool calling
   if (useAgentMode) {
     const readable = makeSSEStream(async (send) => {
       send({ type: 'meta', webSearchUsed: false });
       try {
+        // Prepara i messaggi con system prompt agente
+        const agentMessages = [
+          { role: 'system', content: AGENT_SYSTEM },
+          ...messages.filter(m => m.role !== 'system')
+        ];
+
         const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model, messages, tools: AGENT_TOOLS, tool_choice: 'auto', temperature, max_tokens: maxTokens, stream: false }),
+          body: JSON.stringify({
+            model,
+            messages: agentMessages,
+            tools: AGENT_TOOLS,
+            tool_choice: 'required', // FORZA l'uso di un tool
+            temperature,
+            max_tokens: maxTokens,
+            stream: false,
+          }),
         });
+
         if (!groqRes.ok) {
           const err = await groqRes.text();
           send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
           return;
         }
+
         const data    = await groqRes.json();
         const message = data.choices && data.choices[0] && data.choices[0].message;
         if (!message) { send({ type: 'error', message: 'Nessuna risposta' }); return; }
+
         if (message.tool_calls && message.tool_calls.length > 0) {
           send({ type: 'tool_calls', tool_calls: message.tool_calls, content: message.content || null });
         } else {
@@ -156,6 +184,7 @@ export default async function handler(req) {
           for (let i = 0; i < text.length; i += 4) send({ type: 'token', token: text.slice(i, i + 4) });
         }
         send({ type: 'done' });
+
       } catch (e) {
         send({ type: 'error', message: e.message });
       }
@@ -163,7 +192,7 @@ export default async function handler(req) {
     return new Response(readable, { status: 200, headers: sseHeaders });
   }
 
-  // BRANCH B: STREAMING NORMALE
+  // BRANCH B: STREAMING NORMALE con web search opzionale
   let webContext = '';
   const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
   if (shouldSearch) {
