@@ -11,64 +11,6 @@ const WEB_SEARCH_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione)\b/i,
 ];
 
-const AGENT_TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'web_search',
-      description: 'Cerca informazioni aggiornate su internet. USA SEMPRE questo tool per: notizie, sport, persone famose, eventi recenti, classifiche, risultati, meteo, prezzi. NON rispondere mai dalla memoria su questi argomenti.',
-      parameters: {
-        type: 'object',
-        properties: { query: { type: 'string', description: 'La query di ricerca specifica' } },
-        required: ['query']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'get_current_datetime',
-      description: 'Restituisce la data e ora corrente. USA SEMPRE questo tool quando chiedono che ore sono, che giorno e, la data di oggi.',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'calculate',
-      description: 'Esegue calcoli matematici precisi. USA SEMPRE questo tool per percentuali, operazioni aritmetiche, conversioni numeriche.',
-      parameters: {
-        type: 'object',
-        properties: { expression: { type: 'string', description: "L'espressione matematica da calcolare" } },
-        required: ['expression']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'remember',
-      description: "Salva un'informazione nella memoria dell'utente. USA questo tool quando l'utente dice 'ricorda che...' o vuole salvare qualcosa.",
-      parameters: {
-        type: 'object',
-        properties: { note: { type: 'string', description: "L'informazione da salvare" } },
-        required: ['note']
-      }
-    }
-  }
-];
-
-// System prompt agente — forza l'uso dei tool
-const AGENT_SYSTEM = `Sei AInstAIn, un assistente AI italiano con accesso a tool potenti.
-
-REGOLE FONDAMENTALI:
-1. Per qualsiasi domanda su notizie, sport, persone, eventi, classifiche, risultati, meteo, prezzi → USA SEMPRE web_search. MAI rispondere dalla memoria.
-2. Per domande su data/ora → USA SEMPRE get_current_datetime.
-3. Per calcoli matematici → USA SEMPRE calculate.
-4. Quando l'utente vuole salvare qualcosa → USA remember.
-5. Rispondi SEMPRE in italiano.
-6. Dopo aver usato un tool, usa i risultati per dare una risposta precisa e aggiornata.`;
-
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) return content.filter(c => c.type === 'text').map(c => c.text || '').join(' ');
@@ -108,6 +50,85 @@ function makeSSEStream(fn) {
   return readable;
 }
 
+// ── Esegue un tool lato server ────────────────────────────────────────
+async function executeTool(name, args, tavilyKey) {
+  if (name === 'web_search') {
+    if (!tavilyKey) return 'Web search non disponibile (TAVILY_API_KEY mancante).';
+    try {
+      const results = await tavilySearch(args.query || '', tavilyKey);
+      return results || 'Nessun risultato trovato.';
+    } catch(e) {
+      return 'Errore ricerca: ' + e.message;
+    }
+  }
+  if (name === 'get_current_datetime') {
+    const now = new Date();
+    return 'Data e ora corrente: ' + now.toLocaleString('it-IT', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short'
+    });
+  }
+  if (name === 'calculate') {
+    try {
+      const expr = (args.expression || '')
+        .replace(/[^0-9+\-*/().,% \tsqrtpowlogabsfloorceile]/gi, '')
+        .replace(/sqrt\(/g, 'Math.sqrt(').replace(/pow\(/g, 'Math.pow(')
+        .replace(/log\(/g, 'Math.log(').replace(/abs\(/g, 'Math.abs(')
+        .replace(/floor\(/g, 'Math.floor(').replace(/ceil\(/g, 'Math.ceil(')
+        .replace(/(\d+(?:\.\d+)?)\s*%\s*(?:di\s*)?(\d+(?:\.\d+)?)/gi, '($1/100*$2)');
+      // eslint-disable-next-line no-new-func
+      const result = Function('"use strict"; return (' + expr + ')')();
+      return 'Risultato: ' + result;
+    } catch(e) {
+      return 'Impossibile calcolare: ' + e.message;
+    }
+  }
+  if (name === 'remember') {
+    return 'Memorizzato: "' + (args.note || '') + '"';
+  }
+  return 'Tool "' + name + '" non riconosciuto.';
+}
+
+const AGENT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Cerca informazioni aggiornate su internet. Usa per notizie, sport, eventi recenti, persone famose, classifiche, risultati.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_current_datetime',
+      description: 'Restituisce data e ora corrente.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'calculate',
+      description: 'Calcola espressioni matematiche: percentuali, operazioni, conversioni.',
+      parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remember',
+      description: "Salva un'informazione nella memoria utente.",
+      parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] }
+    }
+  }
+];
+
+const AGENT_SYSTEM = 'Sei AInstAIn, un assistente AI italiano con tool disponibili. ' +
+  'Usa SEMPRE i tool appropriati: web_search per qualsiasi informazione recente o fattuale, ' +
+  'get_current_datetime per data/ora, calculate per calcoli, remember per salvare note. ' +
+  'Rispondi sempre in italiano.';
+
 export default async function handler(req) {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -137,52 +158,89 @@ export default async function handler(req) {
 
   const groqKey   = process.env.GROQ_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
-
   if (!groqKey) return new Response(JSON.stringify({ error: 'GROQ_API_KEY mancante' }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   const sseHeaders = { ...corsHeaders, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
-  // BRANCH A: AGENTE con tool calling
+  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH A: AGENTE — loop ReAct server-side (max 6 iterazioni)
+  // ══════════════════════════════════════════════════════════════════════
   if (useAgentMode) {
     const readable = makeSSEStream(async (send) => {
       send({ type: 'meta', webSearchUsed: false });
       try {
-        // Prepara i messaggi con system prompt agente
-        const agentMessages = [
+        const MAX_ITER = 6;
+        let msgs = [
           { role: 'system', content: AGENT_SYSTEM },
           ...messages.filter(m => m.role !== 'system')
         ];
 
-        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            messages: agentMessages,
-            tools: AGENT_TOOLS,
-            tool_choice: 'required', // FORZA l'uso di un tool
-            temperature,
-            max_tokens: maxTokens,
-            stream: false,
-          }),
-        });
+        for (let iter = 0; iter < MAX_ITER; iter++) {
+          // Segnala al client quale step siamo
+          send({ type: 'agent_step', step: iter + 1, max: MAX_ITER });
 
-        if (!groqRes.ok) {
-          const err = await groqRes.text();
-          send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
-          return;
+          const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model,
+              messages: msgs,
+              tools: AGENT_TOOLS,
+              tool_choice: 'auto',
+              temperature,
+              max_tokens: maxTokens,
+              stream: false,
+            }),
+          });
+
+          if (!groqRes.ok) {
+            const err = await groqRes.text();
+            send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
+            return;
+          }
+
+          const data    = await groqRes.json();
+          const message = data.choices && data.choices[0] && data.choices[0].message;
+          if (!message) { send({ type: 'error', message: 'Nessuna risposta' }); return; }
+
+          const toolCalls = message.tool_calls;
+
+          // ── Risposta finale: nessun tool call ──────────────────────
+          if (!toolCalls || toolCalls.length === 0) {
+            const text = message.content || '';
+            for (let i = 0; i < text.length; i += 4) send({ type: 'token', token: text.slice(i, i + 4) });
+            send({ type: 'done' });
+            return;
+          }
+
+          // ── Il modello vuole usare dei tool ─────────────────────────
+          // Informa il client quali tool vengono usati
+          const toolNames = toolCalls.map(tc => tc.function && tc.function.name).filter(Boolean);
+          send({ type: 'agent_tools', tools: toolNames });
+
+          // Aggiungi il messaggio assistant con tool_calls
+          msgs.push({ role: 'assistant', content: message.content || null, tool_calls: toolCalls });
+
+          // Esegui i tool LATO SERVER e aggiungi i risultati
+          for (const tc of toolCalls) {
+            const name = tc.function && tc.function.name;
+            let args = {};
+            try { args = JSON.parse(tc.function && tc.function.arguments || '{}'); } catch {}
+
+            const result = await executeTool(name, args, tavilyKey);
+
+            msgs.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              name: name,
+              content: String(result)
+            });
+          }
+          // Continua il loop — il modello vedrà i risultati
         }
 
-        const data    = await groqRes.json();
-        const message = data.choices && data.choices[0] && data.choices[0].message;
-        if (!message) { send({ type: 'error', message: 'Nessuna risposta' }); return; }
-
-        if (message.tool_calls && message.tool_calls.length > 0) {
-          send({ type: 'tool_calls', tool_calls: message.tool_calls, content: message.content || null });
-        } else {
-          const text = message.content || '';
-          for (let i = 0; i < text.length; i += 4) send({ type: 'token', token: text.slice(i, i + 4) });
-        }
+        // Limite iterazioni raggiunto
+        send({ type: 'token', token: 'Ho raggiunto il limite di passi. Riprova con una domanda più specifica.' });
         send({ type: 'done' });
 
       } catch (e) {
@@ -192,7 +250,9 @@ export default async function handler(req) {
     return new Response(readable, { status: 200, headers: sseHeaders });
   }
 
+  // ══════════════════════════════════════════════════════════════════════
   // BRANCH B: STREAMING NORMALE con web search opzionale
+  // ══════════════════════════════════════════════════════════════════════
   let webContext = '';
   const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
   if (shouldSearch) {
