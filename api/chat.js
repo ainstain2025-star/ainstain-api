@@ -11,6 +11,46 @@ const WEB_SEARCH_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione)\b/i,
 ];
 
+const AGENT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Cerca informazioni aggiornate su internet. Usa per notizie, sport, eventi recenti, persone famose, classifiche, risultati.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_current_datetime',
+      description: 'Restituisce data e ora corrente.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'calculate',
+      description: 'Calcola espressioni matematiche.',
+      parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'remember',
+      description: "Salva un'informazione nella memoria utente.",
+      parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] }
+    }
+  }
+];
+
+const AGENT_SYSTEM = 'Sei AInstAIn, un assistente AI italiano con tool disponibili. ' +
+  'Usa SEMPRE i tool appropriati: web_search per qualsiasi informazione recente o fattuale, ' +
+  'get_current_datetime per data/ora, calculate per calcoli, remember per salvare note. ' +
+  'Rispondi sempre in italiano.';
+
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) return content.filter(c => c.type === 'text').map(c => c.text || '').join(' ');
@@ -41,6 +81,31 @@ async function tavilySearch(query, apiKey) {
   return (data.results || []).map(r => '- ' + r.title + ': ' + (r.content || '') + ' (' + r.url + ')').join('\n');
 }
 
+async function executeTool(name, args, tavilyKey) {
+  if (name === 'web_search') {
+    if (!tavilyKey) return 'Web search non disponibile.';
+    try { return await tavilySearch(args.query || '', tavilyKey) || 'Nessun risultato.'; }
+    catch(e) { return 'Errore ricerca: ' + e.message; }
+  }
+  if (name === 'get_current_datetime') {
+    return 'Data e ora corrente: ' + new Date().toLocaleString('it-IT', {
+      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+      hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
+    });
+  }
+  if (name === 'calculate') {
+    try {
+      const expr = (args.expression || '').replace(/[^0-9+\-*/().,% \t]/gi, '');
+      const result = Function('"use strict"; return (' + expr + ')')();
+      return 'Risultato: ' + result;
+    } catch(e) { return 'Impossibile calcolare: ' + e.message; }
+  }
+  if (name === 'remember') {
+    return 'Memorizzato: "' + (args.note || '') + '"';
+  }
+  return 'Tool non riconosciuto: ' + name;
+}
+
 function makeSSEStream(fn) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
@@ -49,85 +114,6 @@ function makeSSEStream(fn) {
   (async () => { try { await fn(send); } finally { writer.close(); } })();
   return readable;
 }
-
-// ── Esegue un tool lato server ────────────────────────────────────────
-async function executeTool(name, args, tavilyKey) {
-  if (name === 'web_search') {
-    if (!tavilyKey) return 'Web search non disponibile (TAVILY_API_KEY mancante).';
-    try {
-      const results = await tavilySearch(args.query || '', tavilyKey);
-      return results || 'Nessun risultato trovato.';
-    } catch(e) {
-      return 'Errore ricerca: ' + e.message;
-    }
-  }
-  if (name === 'get_current_datetime') {
-    const now = new Date();
-    return 'Data e ora corrente: ' + now.toLocaleString('it-IT', {
-      weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-      hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short'
-    });
-  }
-  if (name === 'calculate') {
-    try {
-      const expr = (args.expression || '')
-        .replace(/[^0-9+\-*/().,% \tsqrtpowlogabsfloorceile]/gi, '')
-        .replace(/sqrt\(/g, 'Math.sqrt(').replace(/pow\(/g, 'Math.pow(')
-        .replace(/log\(/g, 'Math.log(').replace(/abs\(/g, 'Math.abs(')
-        .replace(/floor\(/g, 'Math.floor(').replace(/ceil\(/g, 'Math.ceil(')
-        .replace(/(\d+(?:\.\d+)?)\s*%\s*(?:di\s*)?(\d+(?:\.\d+)?)/gi, '($1/100*$2)');
-      // eslint-disable-next-line no-new-func
-      const result = Function('"use strict"; return (' + expr + ')')();
-      return 'Risultato: ' + result;
-    } catch(e) {
-      return 'Impossibile calcolare: ' + e.message;
-    }
-  }
-  if (name === 'remember') {
-    return 'Memorizzato: "' + (args.note || '') + '"';
-  }
-  return 'Tool "' + name + '" non riconosciuto.';
-}
-
-const AGENT_TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'web_search',
-      description: 'Cerca informazioni aggiornate su internet. Usa per notizie, sport, eventi recenti, persone famose, classifiche, risultati.',
-      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'get_current_datetime',
-      description: 'Restituisce data e ora corrente.',
-      parameters: { type: 'object', properties: {} }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'calculate',
-      description: 'Calcola espressioni matematiche: percentuali, operazioni, conversioni.',
-      parameters: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'remember',
-      description: "Salva un'informazione nella memoria utente.",
-      parameters: { type: 'object', properties: { note: { type: 'string' } }, required: ['note'] }
-    }
-  }
-];
-
-const AGENT_SYSTEM = 'Sei AInstAIn, un assistente AI italiano con tool disponibili. ' +
-  'Usa SEMPRE i tool appropriati: web_search per qualsiasi informazione recente o fattuale, ' +
-  'get_current_datetime per data/ora, calculate per calcoli, remember per salvare note. ' +
-  'Rispondi sempre in italiano.';
 
 export default async function handler(req) {
   const corsHeaders = {
@@ -139,18 +125,23 @@ export default async function handler(req) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: corsHeaders });
   if (req.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: corsHeaders });
 
-  let messages, model, forceWebSearch, useAgentMode, temperature, maxTokens;
+  let body;
   try {
-    const body   = JSON.parse(await req.text());
-    messages     = body.messages;
-    model        = body.model || 'llama-3.3-70b-versatile';
-    forceWebSearch = body.webSearch === true;
-    useAgentMode = body.agentMode === true;
-    temperature  = body.temperature != null ? body.temperature : 0.7;
-    maxTokens    = body.max_tokens || 1024;
+    body = JSON.parse(await req.text());
   } catch (e) {
     return new Response(JSON.stringify({ error: 'Invalid body: ' + e.message }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
+
+  // ── DEBUG: logga i campi chiave del body ────────────────────────────
+  console.log('[AInstAIn] body keys:', Object.keys(body).join(','));
+  console.log('[AInstAIn] agentMode:', body.agentMode, '| model:', body.model, '| msgs:', body.messages && body.messages.length);
+
+  const messages     = body.messages;
+  const model        = body.model || 'llama-3.3-70b-versatile';
+  const forceWebSearch = body.webSearch === true;
+  const useAgentMode = body.agentMode === true;
+  const temperature  = body.temperature != null ? body.temperature : 0.7;
+  const maxTokens    = body.max_tokens || 1024;
 
   if (!messages || !Array.isArray(messages)) {
     return new Response(JSON.stringify({ error: 'messages array required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -162,10 +153,11 @@ export default async function handler(req) {
 
   const sseHeaders = { ...corsHeaders, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
-  // ══════════════════════════════════════════════════════════════════════
-  // BRANCH A: AGENTE — loop ReAct server-side (max 6 iterazioni)
-  // ══════════════════════════════════════════════════════════════════════
+  console.log('[AInstAIn] useAgentMode:', useAgentMode);
+
+  // BRANCH A: AGENTE
   if (useAgentMode) {
+    console.log('[AInstAIn] Entering agent branch');
     const readable = makeSSEStream(async (send) => {
       send({ type: 'meta', webSearchUsed: false });
       try {
@@ -176,25 +168,18 @@ export default async function handler(req) {
         ];
 
         for (let iter = 0; iter < MAX_ITER; iter++) {
-          // Segnala al client quale step siamo
           send({ type: 'agent_step', step: iter + 1, max: MAX_ITER });
+          console.log('[AInstAIn] Agent iter', iter + 1, '| msgs:', msgs.length);
 
           const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model,
-              messages: msgs,
-              tools: AGENT_TOOLS,
-              tool_choice: 'auto',
-              temperature,
-              max_tokens: maxTokens,
-              stream: false,
-            }),
+            body: JSON.stringify({ model, messages: msgs, tools: AGENT_TOOLS, tool_choice: 'auto', temperature, max_tokens: maxTokens, stream: false }),
           });
 
           if (!groqRes.ok) {
             const err = await groqRes.text();
+            console.log('[AInstAIn] Groq error:', groqRes.status, err.slice(0, 200));
             send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
             return;
           }
@@ -204,8 +189,8 @@ export default async function handler(req) {
           if (!message) { send({ type: 'error', message: 'Nessuna risposta' }); return; }
 
           const toolCalls = message.tool_calls;
+          console.log('[AInstAIn] finish_reason:', data.choices[0].finish_reason, '| tool_calls:', toolCalls ? toolCalls.length : 0);
 
-          // ── Risposta finale: nessun tool call ──────────────────────
           if (!toolCalls || toolCalls.length === 0) {
             const text = message.content || '';
             for (let i = 0; i < text.length; i += 4) send({ type: 'token', token: text.slice(i, i + 4) });
@@ -213,46 +198,31 @@ export default async function handler(req) {
             return;
           }
 
-          // ── Il modello vuole usare dei tool ─────────────────────────
-          // Informa il client quali tool vengono usati
           const toolNames = toolCalls.map(tc => tc.function && tc.function.name).filter(Boolean);
           send({ type: 'agent_tools', tools: toolNames });
-
-          // Aggiungi il messaggio assistant con tool_calls
           msgs.push({ role: 'assistant', content: message.content || null, tool_calls: toolCalls });
 
-          // Esegui i tool LATO SERVER e aggiungi i risultati
           for (const tc of toolCalls) {
             const name = tc.function && tc.function.name;
             let args = {};
             try { args = JSON.parse(tc.function && tc.function.arguments || '{}'); } catch {}
-
+            console.log('[AInstAIn] Executing tool:', name, '| args:', JSON.stringify(args).slice(0, 100));
             const result = await executeTool(name, args, tavilyKey);
-
-            msgs.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              name: name,
-              content: String(result)
-            });
+            msgs.push({ role: 'tool', tool_call_id: tc.id, name: name, content: String(result) });
           }
-          // Continua il loop — il modello vedrà i risultati
         }
 
-        // Limite iterazioni raggiunto
-        send({ type: 'token', token: 'Ho raggiunto il limite di passi. Riprova con una domanda più specifica.' });
+        send({ type: 'token', token: 'Ho raggiunto il limite di passi. Riprova.' });
         send({ type: 'done' });
-
       } catch (e) {
+        console.log('[AInstAIn] Agent error:', e.message);
         send({ type: 'error', message: e.message });
       }
     });
     return new Response(readable, { status: 200, headers: sseHeaders });
   }
 
-  // ══════════════════════════════════════════════════════════════════════
-  // BRANCH B: STREAMING NORMALE con web search opzionale
-  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH B: STREAMING NORMALE
   let webContext = '';
   const shouldSearch = tavilyKey && (forceWebSearch || needsWebSearch(messages));
   if (shouldSearch) {
