@@ -174,7 +174,9 @@ export default async function handler(req) {
           const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model, messages: msgs, tools: AGENT_TOOLS, tool_choice: 'auto', temperature, max_tokens: maxTokens, stream: false }),
+            // Modello ottimizzato per tool calling
+            const toolModel = 'llama3-groq-70b-8192-tool-use-preview';
+            body: JSON.stringify({ model: toolModel, messages: msgs, tools: AGENT_TOOLS, tool_choice: 'auto', temperature, max_tokens: maxTokens, stream: false }),
           });
 
           if (!groqRes.ok) {
