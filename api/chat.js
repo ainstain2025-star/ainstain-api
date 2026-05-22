@@ -1,7 +1,7 @@
 export const config = { runtime: 'edge' };
 
 const WEB_TRIGGERS = [
-  /\b(oggi|adesso|ora|attuale|attualmente|recente|recentemente|ultimo|ultimi|ultime|notizie|news)\b/i,
+  /\b(oggi|adesso|ora|attuale|attualmente|recente|recentemente|ultimo|ultima|ultimi|ultime|notizie|news|ha vinto|hanno vinto|chi ha|chi è|dov'è)\b/i,
   /\b(2024|2025|2026)\b/,
   /\b(today|now|current|currently|latest|recent|news)\b/i,
   /\b(chi è|chi sono|cos'è|dov'è|quando è|quanto costa)\b/i,
