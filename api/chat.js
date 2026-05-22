@@ -59,12 +59,12 @@ export default async function handler(req) {
   try { body = JSON.parse(await req.text()); }
   catch (e) { return new Response(JSON.stringify({ error: 'Invalid body' }), { status: 400, headers: { ...cors, 'Content-Type': 'application/json' } }); }
 
-  const messages     = body.messages || [];
-  const model        = body.model || 'llama-3.3-70b-versatile';
-  const forceWeb     = body.webSearch === true;
-  const agentMode    = body.agentMode === true;
-  const temperature  = body.temperature != null ? body.temperature : 0.7;
-  const maxTokens    = body.max_tokens || 1024;
+  const messages    = body.messages || [];
+  const model       = body.model || 'llama-3.3-70b-versatile';
+  const forceWeb    = body.webSearch === true;
+  const agentMode   = body.agentMode === true;
+  const temperature = body.temperature != null ? body.temperature : 0.7;
+  const maxTokens   = body.max_tokens || 1024;
 
   const groqKey   = process.env.GROQ_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
@@ -73,18 +73,18 @@ export default async function handler(req) {
   const sseH = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
   const userText = getLastUserText(messages);
 
+  // DEBUG — visibile in Vercel Logs
+  console.log('[AInstAIn] agentMode=' + agentMode + ' | userText=' + userText.slice(0, 80));
+
   // ══════════════════════════════════════════════════════════════════════
-  // MODALITÀ AGENTE: analisi domanda → esegui tool → risposta arricchita
-  // Nessun tool calling nativo Groq — tutto server-side
+  // MODALITÀ AGENTE
   // ══════════════════════════════════════════════════════════════════════
   if (agentMode) {
     const readable = makeSSE(async (send) => {
       send({ type: 'meta', webSearchUsed: false });
-
       let toolContext = '';
       let toolUsed = null;
 
-      // 1. Datetime
       if (DATETIME_RE.test(userText)) {
         toolUsed = 'get_current_datetime';
         send({ type: 'agent_step', step: 1, max: 2 });
@@ -93,49 +93,52 @@ export default async function handler(req) {
         toolContext = '\n\n[TOOL: get_current_datetime]\n' +
           now.toLocaleString('it-IT', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }) +
           '\n[/TOOL]\n\nUsa questa informazione per rispondere.';
+        console.log('[AInstAIn] Tool: get_current_datetime');
       }
-      // 2. Calcolo
       else if (CALC_RE.test(userText)) {
         toolUsed = 'calculate';
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['calculate'] });
         try {
           const expr = userText
-            .replace(/(\d+(?:[.,]\d+)?)\s*%\s*di\s*(\d+(?:[.,]\d+)?)/gi, (_, a, b) =>
-              '(' + a.replace(',', '.') + '/100*' + b.replace(',', '.') + ')')
-            .replace(/[^0-9+\-*/().,]/g, ' ')
-            .trim();
+            .replace(/(\d+(?:[.,]\d+)?)\s*%\s*di\s*(\d+(?:[.,]\d+)?)/gi, (_, a, b) => '(' + a.replace(',', '.') + '/100*' + b.replace(',', '.') + ')')
+            .replace(/[^0-9+\-*/().,]/g, ' ').trim();
           const result = Function('"use strict"; return (' + expr + ')')();
-          toolContext = '\n\n[TOOL: calculate]\nRisultato del calcolo: ' + result + '\n[/TOOL]\n\nUsa questo risultato per rispondere.';
+          toolContext = '\n\n[TOOL: calculate]\nRisultato: ' + result + '\n[/TOOL]\n\nUsa questo risultato per rispondere.';
         } catch(e) {
-          toolContext = '\n\n[TOOL: calculate]\nImpossibile calcolare automaticamente. Spiega come fare il calcolo.\n[/TOOL]';
+          toolContext = '\n\n[TOOL: calculate]\nImpossibile calcolare. Spiega come farlo.\n[/TOOL]';
         }
+        console.log('[AInstAIn] Tool: calculate');
       }
-      // 3. Remember
       else if (REMEMBER_RE.test(userText)) {
         toolUsed = 'remember';
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['remember'] });
         const note = userText.replace(REMEMBER_RE, '').trim();
-        toolContext = '\n\n[TOOL: remember]\nInformazione salvata in memoria: "' + note + '"\n[/TOOL]\n\nConferma all\'utente che hai salvato questa informazione.';
+        toolContext = '\n\n[TOOL: remember]\nInformazione salvata: "' + note + '"\n[/TOOL]\n\nConferma all\'utente che hai salvato questa informazione.';
         send({ type: 'agent_saved', note });
+        console.log('[AInstAIn] Tool: remember | note=' + note.slice(0, 50));
       }
-      // 4. Web search
       else if (tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)))) {
         toolUsed = 'web_search';
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['web_search'] });
+        console.log('[AInstAIn] Tool: web_search | query=' + userText.slice(0, 80));
         try {
           const results = await tavilySearch(userText.slice(0, 200), tavilyKey);
           const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
           toolContext = '\n\n[TOOL: web_search - ' + today + ']\n' + results + '\n[/TOOL]\n\nUsa questi risultati aggiornati per rispondere. Cita le fonti.';
+          console.log('[AInstAIn] Tavily OK | results=' + results.slice(0, 100));
         } catch(e) {
           toolContext = '\n\n[TOOL: web_search]\nRicerca non disponibile: ' + e.message + '\n[/TOOL]';
+          console.log('[AInstAIn] Tavily ERROR: ' + e.message);
         }
+      } else {
+        console.log('[AInstAIn] No tool matched for: ' + userText.slice(0, 80));
       }
 
-      // 2. Prepara messaggi con contesto tool iniettato nel system prompt
       send({ type: 'agent_step', step: toolUsed ? 2 : 1, max: toolUsed ? 2 : 1 });
+
       let finalMsgs = [...messages];
       if (toolContext) {
         const agentSystem = 'Sei AInstAIn, un assistente AI italiano con accesso a tool.' + toolContext;
@@ -144,7 +147,6 @@ export default async function handler(req) {
         else finalMsgs.unshift({ role: 'system', content: agentSystem });
       }
 
-      // 3. Chiama Groq in streaming normale
       try {
         const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
           method: 'POST',
@@ -153,6 +155,7 @@ export default async function handler(req) {
         });
         if (!groqRes.ok) {
           const err = await groqRes.text();
+          console.log('[AInstAIn] Groq error: ' + groqRes.status + ' ' + err.slice(0, 100));
           send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
           return;
         }
@@ -176,6 +179,7 @@ export default async function handler(req) {
           }
         }
       } catch(e) {
+        console.log('[AInstAIn] Stream error: ' + e.message);
         send({ type: 'error', message: e.message });
       }
     });
@@ -183,7 +187,7 @@ export default async function handler(req) {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // STREAMING NORMALE con web search opzionale
+  // STREAMING NORMALE
   // ══════════════════════════════════════════════════════════════════════
   let webCtx = '';
   const shouldSearch = tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
