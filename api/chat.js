@@ -123,9 +123,11 @@ export default async function handler(req) {
         toolUsed = 'web_search';
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['web_search'] });
-        console.log('[AInstAIn] Tool: web_search | query=' + userText.slice(0, 80));
+        const year = new Date().getFullYear();
+        const searchQuery = userText.slice(0, 150) + ' ' + year;
+        console.log('[AInstAIn] Tool: web_search | query=' + searchQuery);
         try {
-          const results = await tavilySearch(userText.slice(0, 200), tavilyKey);
+          const results = await tavilySearch(searchQuery, tavilyKey);
           const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
           toolContext = '\n\n[TOOL: web_search - ' + today + ']\n' + results + '\n[/TOOL]\n\nUsa questi risultati aggiornati per rispondere. Cita le fonti.';
           console.log('[AInstAIn] Tavily OK | results=' + results.slice(0, 100));
