@@ -11,7 +11,8 @@ const WEB_TRIGGERS = [
   /\b(elezioni|governo|presidente|premier|ministro)\b/i,
 ];
 
-const CALC_RE = /\b(\d[\d\s]*[%+\-*/]\s*[\d\s]+|\d+\s*%\s*di\s*\d+)\b/i;
+// CALC_RE: richiede keyword esplicite o operatori tra numeri non-anno
+const CALC_RE = /(quanto\s+fa\s+|calcola\s+|\d+\s*%\s*di\s*\d+|(?<!\d{3})\d{1,3}\s*[+*/]\s*\d+(?!\d)|\b\d{1,3}\s*-\s*\d{1,3}\b(?!\s*\d))/i;
 const DATETIME_RE = /\b(che ore|che giorno|che data|oggi è|giorno è|ora è|data oggi|orario)\b/i;
 const REMEMBER_RE = /\b(ricorda che|memorizza|salva che|tieni a mente)\b/i;
 
