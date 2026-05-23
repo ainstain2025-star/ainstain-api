@@ -30,11 +30,13 @@ async function tavilySearch(query, apiKey) {
   const res = await fetch('https://api.tavily.com/search', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: apiKey, query, search_depth: 'basic', max_results: 5 }),
+    body: JSON.stringify({ api_key: apiKey, query, search_depth: 'advanced', max_results: 5, include_answer: true }),
   });
   if (!res.ok) throw new Error('Tavily ' + res.status);
   const data = await res.json();
-  return (data.results || []).map(r => '- ' + r.title + ': ' + (r.content || '') + ' (' + r.url + ')').join('\n');
+  const answer = data.answer ? 'Risposta diretta: ' + data.answer + '\n\n' : '';
+  const results = (data.results || []).map(r => '- ' + r.title + ': ' + (r.content || '') + ' (' + r.url + ')').join('\n');
+  return answer + results;
 }
 
 function makeSSE(fn) {
@@ -124,7 +126,9 @@ export default async function handler(req) {
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['web_search'] });
         const year = new Date().getFullYear();
-        const searchQuery = userText.slice(0, 150) + ' ' + year;
+        // Usa query in inglese per risultati Tavily più precisi
+        const rawQuery = userText.slice(0, 150);
+        const searchQuery = rawQuery + ' ' + year;
         console.log('[AInstAIn] Tool: web_search | query=' + searchQuery);
         try {
           const results = await tavilySearch(searchQuery, tavilyKey);
