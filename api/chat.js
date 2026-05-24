@@ -148,10 +148,18 @@ export default async function handler(req) {
 
       let finalMsgs = [...messages];
       if (toolContext) {
-        const agentSystem = 'Sei AInstAIn, un assistente AI italiano con accesso a tool.' + toolContext;
+        // Usa il system prompt originale della persona se presente, altrimenti uno di default
+        const originalSystem = finalMsgs.find(m => m.role === 'system');
+        const baseSystem = originalSystem
+          ? originalSystem.content
+          : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
+        const agentSystem = baseSystem + toolContext;
         const sysIdx = finalMsgs.findIndex(m => m.role === 'system');
-        if (sysIdx !== -1) finalMsgs[sysIdx] = { ...finalMsgs[sysIdx], content: agentSystem };
-        else finalMsgs.unshift({ role: 'system', content: agentSystem });
+        if (sysIdx !== -1) {
+          finalMsgs[sysIdx] = { ...finalMsgs[sysIdx], content: agentSystem };
+        } else {
+          finalMsgs.unshift({ role: 'system', content: agentSystem });
+        }
       }
 
       try {
