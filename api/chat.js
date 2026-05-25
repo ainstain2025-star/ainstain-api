@@ -13,6 +13,12 @@ const WEB_TRIGGERS = [
 
 // CALC_RE: richiede keyword esplicite o operatori tra numeri non-anno
 const CALC_RE = /(quanto\s+fa\s+|calcola\s+|\d+\s*%\s*di\s*\d+|(?<!\d{3})\d{1,3}\s*[+*/]\s*\d+(?!\d)|\b\d{1,3}\s*-\s*\d{1,3}\b(?!\s*\d))/i;
+const IMAGE_RE = /\b(genera|crea|disegna|illustra|mostrami|dipingi|produci)\s+(un[ao]?\s+)?(immagine|foto|illustrazione|dipinto|disegno|artwork|wallpaper|poster|logo)/i;
+
+function buildPollinationsUrl(prompt) {
+  const encoded = encodeURIComponent(prompt);
+  return 'https://image.pollinations.ai/prompt/' + encoded + '?width=1024&height=1024&nologo=true&model=flux';
+}
 const DATETIME_RE = /\b(che ore|che giorno|che data|oggi è|giorno è|ora è|data oggi|orario)\b/i;
 const REMEMBER_RE = /\b(ricorda che|memorizza|salva che|tieni a mente)\b/i;
 
@@ -122,6 +128,26 @@ export default async function handler(req) {
         send({ type: 'agent_saved', note });
         console.log('[AInstAIn] Tool: remember | note=' + note.slice(0, 50));
       }
+      // Tool: generate_image
+      else if (IMAGE_RE.test(userText)) {
+        toolUsed = 'generate_image';
+        send({ type: 'agent_step', step: 1, max: 1 });
+        send({ type: 'agent_tools', tools: ['generate_image'] });
+        console.log('[AInstAIn] Tool: generate_image | prompt=' + userText.slice(0, 80));
+        // Estrai il prompt dall'input utente (rimuove verbi di comando)
+        const imgPrompt = userText
+          .replace(IMAGE_RE, '')
+          .replace(/^[\s,.:]+/, '')
+          .trim() || userText;
+        // Migliora il prompt in inglese per Pollinations
+        const enhancedPrompt = imgPrompt + ', high quality, detailed, artistic';
+        const imgUrl = buildPollinationsUrl(enhancedPrompt);
+        // Manda subito l'evento con l'URL — Pollinations genera on-the-fly
+        send({ type: 'agent_image', url: imgUrl, prompt: imgPrompt });
+        send({ type: 'done' });
+        return; // non serve chiamare Groq
+      }
+
       else if (tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)))) {
         toolUsed = 'web_search';
         send({ type: 'agent_step', step: 1, max: 2 });
