@@ -11,16 +11,23 @@ const WEB_TRIGGERS = [
   /\b(elezioni|governo|presidente|premier|ministro)\b/i,
 ];
 
-// CALC_RE: richiede keyword esplicite o operatori tra numeri non-anno
 const CALC_RE = /(quanto\s+fa\s+|calcola\s+|\d+\s*%\s*di\s*\d+|(?<!\d{3})\d{1,3}\s*[+*/]\s*\d+(?!\d)|\b\d{1,3}\s*-\s*\d{1,3}\b(?!\s*\d))/i;
 const IMAGE_RE = /\b(genera|crea|disegna|illustra|mostrami|dipingi|produci)\s+(un[ao]?\s+)?(immagine|foto|illustrazione|dipinto|disegno|artwork|wallpaper|poster|logo)/i;
+const DATETIME_RE = /\b(che ore|che giorno|che data|oggi è|giorno è|ora è|data oggi|orario)\b/i;
+const REMEMBER_RE = /\b(ricorda che|memorizza|salva che|tieni a mente)\b/i;
+
+// ── Modelli Multi-LLM ─────────────────────────────────────────────────
+const MULTI_MODELS = [
+  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3' },
+  { id: 'gemma2-9b-it',            name: 'Gemma 2'   },
+  { id: 'mixtral-8x7b-32768',      name: 'Mixtral'   },
+];
+const JUDGE_MODEL = 'llama-3.1-8b-instant';
 
 function buildPollinationsUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
   return 'https://image.pollinations.ai/prompt/' + encoded + '?width=1024&height=1024&nologo=true&model=flux';
 }
-const DATETIME_RE = /\b(che ore|che giorno|che data|oggi è|giorno è|ora è|data oggi|orario)\b/i;
-const REMEMBER_RE = /\b(ricorda che|memorizza|salva che|tieni a mente)\b/i;
 
 function extractText(c) {
   if (typeof c === 'string') return c;
@@ -55,6 +62,47 @@ function makeSSE(fn) {
   return readable;
 }
 
+// ── Chiama un singolo modello Groq (non-streaming) ────────────────────
+async function callGroq(model, messages, maxTokens, temperature, groqKey) {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, stream: false }),
+  });
+  if (!res.ok) throw new Error(model + ' error ' + res.status);
+  const data = await res.json();
+  return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+}
+
+// ── Streaming da un modello Groq ──────────────────────────────────────
+async function streamGroq(model, messages, maxTokens, temperature, groqKey, onToken, onDone) {
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, stream: true }),
+  });
+  if (!res.ok) { const e = await res.text(); throw new Error(model + ' ' + res.status + ': ' + e); }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n'); buf = lines.pop();
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
+      try {
+        const j = JSON.parse(t.slice(6));
+        const tok = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+        if (tok) onToken(tok);
+        if (j.choices && j.choices[0] && j.choices[0].finish_reason) onDone();
+      } catch {}
+    }
+  }
+}
+
 export default async function handler(req) {
   const cors = {
     'Access-Control-Allow-Origin': '*',
@@ -72,6 +120,7 @@ export default async function handler(req) {
   const model       = body.model || 'llama-3.3-70b-versatile';
   const forceWeb    = body.webSearch === true;
   const agentMode   = body.agentMode === true;
+  const multiMode   = body.multiMode || null; // 'fast' | 'best' | null
   const temperature = body.temperature != null ? body.temperature : 0.7;
   const maxTokens   = body.max_tokens || 1024;
 
@@ -81,9 +130,98 @@ export default async function handler(req) {
 
   const sseH = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
   const userText = getLastUserText(messages);
+  console.log('[AInstAIn] agentMode=' + agentMode + ' multiMode=' + multiMode + ' | ' + userText.slice(0, 60));
 
-  // DEBUG — visibile in Vercel Logs
-  console.log('[AInstAIn] agentMode=' + agentMode + ' | userText=' + userText.slice(0, 80));
+  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH MULTI-LLM
+  // ══════════════════════════════════════════════════════════════════════
+  if (multiMode) {
+    const readable = makeSSE(async (send) => {
+      send({ type: 'meta', webSearchUsed: false });
+
+      if (multiMode === 'fast') {
+        // Modalità Fast: gara tra i 3 modelli, vince il primo che risponde
+        send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
+        let winner = null;
+        let fullText = '';
+
+        const race = MULTI_MODELS.map(m =>
+          callGroq(m.id, messages, maxTokens, temperature, groqKey)
+            .then(text => ({ model: m, text }))
+            .catch(() => null)
+        );
+
+        const result = await Promise.any(race.map(p => p.then(r => r && r.text ? r : Promise.reject())));
+        if (result) {
+          winner = result.model;
+          fullText = result.text;
+          send({ type: 'multi_winner', model: winner.name });
+          // Simula streaming del testo
+          for (let i = 0; i < fullText.length; i += 4) {
+            send({ type: 'token', token: fullText.slice(i, i + 4) });
+          }
+          send({ type: 'done' });
+          console.log('[AInstAIn] Fast winner: ' + winner.name);
+        } else {
+          send({ type: 'error', message: 'Tutti i modelli hanno fallito' });
+        }
+
+      } else if (multiMode === 'best') {
+        // Modalità Best: chiama tutti in parallelo, giudice sceglie/sintetizza
+        send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
+
+        const results = await Promise.allSettled(
+          MULTI_MODELS.map(m =>
+            callGroq(m.id, messages, Math.min(maxTokens, 512), temperature, groqKey)
+              .then(text => ({ model: m.name, text }))
+          )
+        );
+
+        const valid = results
+          .filter(r => r.status === 'fulfilled' && r.value.text)
+          .map(r => r.value);
+
+        if (valid.length === 0) { send({ type: 'error', message: 'Nessun modello ha risposto' }); return; }
+        if (valid.length === 1) {
+          // Solo uno: usa direttamente
+          send({ type: 'multi_winner', model: valid[0].model });
+          for (let i = 0; i < valid[0].text.length; i += 4) send({ type: 'token', token: valid[0].text.slice(i, i + 4) });
+          send({ type: 'done' });
+          return;
+        }
+
+        // Invia le risposte intermedie al client
+        send({ type: 'multi_responses', responses: valid.map(v => ({ model: v.model, preview: v.text.slice(0, 120) + '...' })) });
+
+        // Giudice: sintetizza la risposta migliore
+        const judgePrompt = 'Hai ricevuto queste risposte da diversi modelli AI alla domanda: "' + userText + '"\n\n' +
+          valid.map((v, i) => 'Modello ' + (i+1) + ' (' + v.model + '):\n' + v.text).join('\n\n---\n\n') +
+          '\n\nSintetizza la risposta più accurata, completa e utile in italiano. ' +
+          'Integra il meglio di ogni risposta senza citare i modelli. ' +
+          'Rispondi direttamente senza preamboli.';
+
+        send({ type: 'multi_judging' });
+        console.log('[AInstAIn] Best mode: judging ' + valid.length + ' responses');
+
+        try {
+          const synthesis = await callGroq(JUDGE_MODEL, [
+            { role: 'system', content: 'Sei un sintetizzatore di risposte AI. Produci sempre testo in italiano.' },
+            { role: 'user', content: judgePrompt }
+          ], maxTokens, 0.3, groqKey);
+
+          send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
+          for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i + 4) });
+          send({ type: 'done' });
+        } catch(e) {
+          // Fallback: usa la prima risposta valida
+          send({ type: 'multi_winner', model: valid[0].model });
+          for (let i = 0; i < valid[0].text.length; i += 4) send({ type: 'token', token: valid[0].text.slice(i, i + 4) });
+          send({ type: 'done' });
+        }
+      }
+    });
+    return new Response(readable, { status: 200, headers: sseH });
+  }
 
   // ══════════════════════════════════════════════════════════════════════
   // MODALITÀ AGENTE
@@ -102,7 +240,6 @@ export default async function handler(req) {
         toolContext = '\n\n[TOOL: get_current_datetime]\n' +
           now.toLocaleString('it-IT', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }) +
           '\n[/TOOL]\n\nUsa questa informazione per rispondere.';
-        console.log('[AInstAIn] Tool: get_current_datetime');
       }
       else if (CALC_RE.test(userText)) {
         toolUsed = 'calculate';
@@ -117,7 +254,6 @@ export default async function handler(req) {
         } catch(e) {
           toolContext = '\n\n[TOOL: calculate]\nImpossibile calcolare. Spiega come farlo.\n[/TOOL]';
         }
-        console.log('[AInstAIn] Tool: calculate');
       }
       else if (REMEMBER_RE.test(userText)) {
         toolUsed = 'remember';
@@ -126,101 +262,48 @@ export default async function handler(req) {
         const note = userText.replace(REMEMBER_RE, '').trim();
         toolContext = '\n\n[TOOL: remember]\nInformazione salvata: "' + note + '"\n[/TOOL]\n\nConferma all\'utente che hai salvato questa informazione.';
         send({ type: 'agent_saved', note });
-        console.log('[AInstAIn] Tool: remember | note=' + note.slice(0, 50));
       }
-      // Tool: generate_image
       else if (IMAGE_RE.test(userText)) {
         toolUsed = 'generate_image';
         send({ type: 'agent_step', step: 1, max: 1 });
         send({ type: 'agent_tools', tools: ['generate_image'] });
-        console.log('[AInstAIn] Tool: generate_image | prompt=' + userText.slice(0, 80));
-        // Estrai il prompt dall'input utente (rimuove verbi di comando)
-        const imgPrompt = userText
-          .replace(IMAGE_RE, '')
-          .replace(/^[\s,.:]+/, '')
-          .trim() || userText;
-        // Migliora il prompt in inglese per Pollinations
-        const enhancedPrompt = imgPrompt + ', high quality, detailed, artistic';
-        const imgUrl = buildPollinationsUrl(enhancedPrompt);
-        // Manda subito l'evento con l'URL — Pollinations genera on-the-fly
+        const imgPrompt = userText.replace(IMAGE_RE, '').replace(/^[\s,.:]+/, '').trim() || userText;
+        const imgUrl = buildPollinationsUrl(imgPrompt + ', high quality, detailed, artistic');
         send({ type: 'agent_image', url: imgUrl, prompt: imgPrompt });
         send({ type: 'done' });
-        return; // non serve chiamare Groq
+        return;
       }
-
       else if (tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)))) {
         toolUsed = 'web_search';
         send({ type: 'agent_step', step: 1, max: 2 });
         send({ type: 'agent_tools', tools: ['web_search'] });
-        const year = new Date().getFullYear();
-        // Usa query in inglese per risultati Tavily più precisi
-        const rawQuery = userText.slice(0, 150);
-        const searchQuery = rawQuery + ' ' + year;
-        console.log('[AInstAIn] Tool: web_search | query=' + searchQuery);
+        const searchQuery = userText.slice(0, 150) + ' ' + new Date().getFullYear();
         try {
           const results = await tavilySearch(searchQuery, tavilyKey);
           const today = new Date().toLocaleDateString('it-IT', { day: '2-digit', month: 'long', year: 'numeric' });
           toolContext = '\n\n[TOOL: web_search - ' + today + ']\n' + results + '\n[/TOOL]\n\nUsa questi risultati aggiornati per rispondere. Cita le fonti.';
-          console.log('[AInstAIn] Tavily OK | results=' + results.slice(0, 100));
         } catch(e) {
           toolContext = '\n\n[TOOL: web_search]\nRicerca non disponibile: ' + e.message + '\n[/TOOL]';
-          console.log('[AInstAIn] Tavily ERROR: ' + e.message);
         }
-      } else {
-        console.log('[AInstAIn] No tool matched for: ' + userText.slice(0, 80));
       }
 
       send({ type: 'agent_step', step: toolUsed ? 2 : 1, max: toolUsed ? 2 : 1 });
-
       let finalMsgs = [...messages];
       if (toolContext) {
-        // Usa il system prompt originale della persona se presente, altrimenti uno di default
         const originalSystem = finalMsgs.find(m => m.role === 'system');
-        const baseSystem = originalSystem
-          ? originalSystem.content
-          : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
+        const baseSystem = originalSystem ? originalSystem.content : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
         const agentSystem = baseSystem + toolContext;
         const sysIdx = finalMsgs.findIndex(m => m.role === 'system');
-        if (sysIdx !== -1) {
-          finalMsgs[sysIdx] = { ...finalMsgs[sysIdx], content: agentSystem };
-        } else {
-          finalMsgs.unshift({ role: 'system', content: agentSystem });
-        }
+        if (sysIdx !== -1) finalMsgs[sysIdx] = { ...finalMsgs[sysIdx], content: agentSystem };
+        else finalMsgs.unshift({ role: 'system', content: agentSystem });
       }
 
       try {
-        const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model, messages: finalMsgs, max_tokens: maxTokens, temperature, stream: true }),
-        });
-        if (!groqRes.ok) {
-          const err = await groqRes.text();
-          console.log('[AInstAIn] Groq error: ' + groqRes.status + ' ' + err.slice(0, 100));
-          send({ type: 'error', message: 'Groq ' + groqRes.status + ': ' + err });
-          return;
-        }
-        const reader = groqRes.body.getReader();
-        const dec = new TextDecoder();
-        let buf = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n'); buf = lines.pop();
-          for (const line of lines) {
-            const t = line.trim();
-            if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
-            try {
-              const j = JSON.parse(t.slice(6));
-              const tok = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
-              if (tok) send({ type: 'token', token: tok });
-              if (j.choices && j.choices[0] && j.choices[0].finish_reason) send({ type: 'done' });
-            } catch {}
-          }
-        }
+        await streamGroq(model, finalMsgs, maxTokens, temperature, groqKey,
+          tok => send({ type: 'token', token: tok }),
+          () => send({ type: 'done' })
+        );
       } catch(e) {
-        console.log('[AInstAIn] Stream error: ' + e.message);
         send({ type: 'error', message: e.message });
       }
     });
@@ -251,37 +334,12 @@ export default async function handler(req) {
   }
 
   try {
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + groqKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: finalMsgs, max_tokens: maxTokens, temperature, stream: true }),
-    });
-    if (!groqRes.ok) {
-      const e = await groqRes.text();
-      return new Response(JSON.stringify({ error: e }), { status: groqRes.status, headers: { ...cors, 'Content-Type': 'application/json' } });
-    }
-    const usedWeb = shouldSearch && !!webCtx;
     const readable = makeSSE(async (send) => {
-      send({ type: 'meta', webSearchUsed: usedWeb });
-      const reader = groqRes.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split('\n'); buf = lines.pop();
-        for (const line of lines) {
-          const t = line.trim();
-          if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
-          try {
-            const j = JSON.parse(t.slice(6));
-            const tok = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
-            if (tok) send({ type: 'token', token: tok });
-            if (j.choices && j.choices[0] && j.choices[0].finish_reason) send({ type: 'done' });
-          } catch {}
-        }
-      }
+      send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
+      await streamGroq(model, finalMsgs, maxTokens, temperature, groqKey,
+        tok => send({ type: 'token', token: tok }),
+        () => send({ type: 'done' })
+      );
     });
     return new Response(readable, { status: 200, headers: sseH });
   } catch(e) {
