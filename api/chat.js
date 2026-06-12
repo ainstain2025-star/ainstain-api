@@ -1,5 +1,30 @@
 export const config = { runtime: 'edge' };
 
+// ── Provider chain per fallback automatico (Piano C) ─────────────────
+// Se Groq è al limite (429), passa automaticamente al provider successivo.
+// Tutti i provider usano il formato OpenAI-compatible.
+const PROVIDER_CHAIN = [
+  {
+    name: 'Groq',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    model: 'llama-3.3-70b-versatile',
+    keyEnv: 'GROQ_API_KEY',
+  },
+  {
+    name: 'Together',
+    url: 'https://api.together.xyz/v1/chat/completions',
+    model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free',
+    keyEnv: 'TOGETHER_API_KEY',
+  },
+  {
+    name: 'OpenRouter',
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    model: 'meta-llama/llama-3.3-70b-instruct:free',
+    keyEnv: 'OPENROUTER_API_KEY',
+    extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' },
+  },
+];
+
 const WEB_TRIGGERS = [
   /\b(oggi|adesso|ora|attuale|attualmente|recente|recentemente|ultimo|ultima|ultimi|ultime|notizie|news|ha vinto|hanno vinto|chi ha|chi è|dov'è)\b/i,
   /\b(2024|2025|2026)\b/,
@@ -27,6 +52,112 @@ const JUDGE_MODEL = 'llama-3.1-8b-instant';
 function buildPollinationsUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
   return 'https://image.pollinations.ai/prompt/' + encoded + '?width=1024&height=1024&nologo=true&model=flux';
+}
+
+// ── Trova il provider disponibile (con fallback automatico) ──────────
+// Ritorna { provider, apiKey } o null se tutti esauriti.
+function getProviders(env) {
+  return PROVIDER_CHAIN
+    .map(p => ({ ...p, apiKey: env[p.keyEnv] }))
+    .filter(p => p.apiKey);
+}
+
+// ── Chiamata con fallback automatico (non-streaming) ──────────────────
+async function callWithFallback(providers, messages, maxTokens, temperature, model) {
+  for (const p of providers) {
+    try {
+      const res = await fetch(p.url, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + p.apiKey,
+          'Content-Type': 'application/json',
+          ...(p.extraHeaders || {}),
+        },
+        body: JSON.stringify({
+          model: model || p.model,
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+          stream: false,
+        }),
+      });
+      if (res.status === 429 || res.status === 503) {
+        console.log('[AInstAIn] ' + p.name + ' rate limited, trying next...');
+        continue; // prova il prossimo
+      }
+      if (!res.ok) throw new Error(p.name + ' error ' + res.status);
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || '';
+      console.log('[AInstAIn] callWithFallback: used ' + p.name);
+      return { text, provider: p.name };
+    } catch(e) {
+      if (e.message.includes('rate limit') || e.message.includes('429')) {
+        console.log('[AInstAIn] ' + p.name + ' rate limited, trying next...');
+        continue;
+      }
+      console.log('[AInstAIn] ' + p.name + ' error: ' + e.message);
+    }
+  }
+  throw new Error('Tutti i provider AI sono temporaneamente non disponibili. Riprova tra qualche minuto.');
+}
+
+// ── Streaming con fallback automatico ────────────────────────────────
+async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
+  for (const p of providers) {
+    try {
+      const res = await fetch(p.url, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + p.apiKey,
+          'Content-Type': 'application/json',
+          ...(p.extraHeaders || {}),
+        },
+        body: JSON.stringify({
+          model: model || p.model,
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+          stream: true,
+        }),
+      });
+      if (res.status === 429 || res.status === 503) {
+        console.log('[AInstAIn] ' + p.name + ' rate limited, trying next...');
+        continue;
+      }
+      if (!res.ok) {
+        const err = await res.text();
+        if (res.status === 429) { console.log('[AInstAIn] ' + p.name + ' 429, next...'); continue; }
+        throw new Error(p.name + ' ' + res.status + ': ' + err);
+      }
+      console.log('[AInstAIn] streamWithFallback: using ' + p.name);
+      // Stream SSE
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
+          try {
+            const j = JSON.parse(t.slice(6));
+            const tok = j.choices?.[0]?.delta?.content;
+            if (tok) onToken(tok);
+            if (j.choices?.[0]?.finish_reason) {
+              onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done');
+            }
+          } catch {}
+        }
+      }
+      return; // successo, esci dal loop
+    } catch(e) {
+      console.log('[AInstAIn] ' + p.name + ' stream error: ' + e.message);
+      if (p === providers[providers.length - 1]) throw e; // ultimo provider, rilancia
+    }
+  }
 }
 
 function extractText(c) {
@@ -97,7 +228,14 @@ async function streamGroq(model, messages, maxTokens, temperature, groqKey, onTo
         const j = JSON.parse(t.slice(6));
         const tok = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
         if (tok) onToken(tok);
-        if (j.choices && j.choices[0] && j.choices[0].finish_reason) onDone();
+        if (j.choices && j.choices[0] && j.choices[0].finish_reason) {
+          if (j.choices[0].finish_reason === 'length') {
+            // Risposta troncata per limite token
+            onDone('truncated');
+          } else {
+            onDone('done');
+          }
+        }
       } catch {}
     }
   }
@@ -127,6 +265,8 @@ export default async function handler(req) {
   const groqKey   = process.env.GROQ_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
   if (!groqKey) return new Response(JSON.stringify({ error: 'GROQ_API_KEY mancante' }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
+  // Provider chain con fallback automatico
+  const providers = getProviders(process.env);
 
   const sseH = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
   const userText = getLastUserText(messages);
@@ -146,8 +286,8 @@ export default async function handler(req) {
         let fullText = '';
 
         const race = MULTI_MODELS.map(m =>
-          callGroq(m.id, messages, maxTokens, temperature, groqKey)
-            .then(text => ({ model: m, text }))
+          callWithFallback([{ ...providers[0], model: m.id }], messages, maxTokens, temperature, m.id)
+            .then(r => r && r.text ? { model: m, text: r.text } : Promise.reject())
             .catch(() => null)
         );
 
@@ -172,8 +312,8 @@ export default async function handler(req) {
 
         const results = await Promise.allSettled(
           MULTI_MODELS.map(m =>
-            callGroq(m.id, messages, Math.min(maxTokens, 512), temperature, groqKey)
-              .then(text => ({ model: m.name, text }))
+            callWithFallback([{ ...providers[0], model: m.id }], messages, Math.min(maxTokens, 512), temperature, m.id)
+              .then(r => ({ model: m.name, text: r.text }))
           )
         );
 
@@ -204,11 +344,11 @@ export default async function handler(req) {
         console.log('[AInstAIn] Best mode: judging ' + valid.length + ' responses');
 
         try {
-          const synthesis = await callGroq(JUDGE_MODEL, [
+          const judgeResult = await callWithFallback([{ ...providers[0], model: JUDGE_MODEL }], [
             { role: 'system', content: 'Sei un sintetizzatore di risposte AI. Produci sempre testo in italiano.' },
             { role: 'user', content: judgePrompt }
-          ], maxTokens, 0.3, groqKey);
-
+          ], maxTokens, 0.3, JUDGE_MODEL);
+          const synthesis = judgeResult.text;
           send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
           for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i + 4) });
           send({ type: 'done' });
@@ -299,9 +439,9 @@ export default async function handler(req) {
       }
 
       try {
-        await streamGroq(model, finalMsgs, maxTokens, temperature, groqKey,
+        await streamWithFallback(providers, finalMsgs, maxTokens, temperature, model,
           tok => send({ type: 'token', token: tok }),
-          () => send({ type: 'done' })
+          reason => send({ type: reason || 'done' })
         );
       } catch(e) {
         send({ type: 'error', message: e.message });
@@ -336,9 +476,9 @@ export default async function handler(req) {
   try {
     const readable = makeSSE(async (send) => {
       send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
-      await streamGroq(model, finalMsgs, maxTokens, temperature, groqKey,
+      await streamWithFallback(providers, finalMsgs, maxTokens, temperature, model,
         tok => send({ type: 'token', token: tok }),
-        () => send({ type: 'done' })
+        reason => send({ type: reason || 'done' })
       );
     });
     return new Response(readable, { status: 200, headers: sseH });
