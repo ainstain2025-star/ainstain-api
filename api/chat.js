@@ -184,6 +184,33 @@ async function tavilySearch(query, apiKey) {
   return answer + results;
 }
 
+// ── Cache risposte (TTL 1 ora, max 50 entry) ────────────────────────
+const responseCache = new Map();
+const CACHE_TTL = 60 * 60 * 1000; // 1 ora
+const CACHE_MAX = 50;
+
+function getCacheKey(messages, model) {
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  const text = lastUser ? extractText(lastUser.content) : '';
+  return model + ':' + text.slice(0, 200).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function getCached(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL) { responseCache.delete(key); return null; }
+  return entry.text;
+}
+
+function setCache(key, text) {
+  if (responseCache.size >= CACHE_MAX) {
+    // Rimuovi la entry più vecchia
+    const oldest = [...responseCache.entries()].sort((a,b) => a[1].ts - b[1].ts)[0];
+    if (oldest) responseCache.delete(oldest[0]);
+  }
+  responseCache.set(key, { text, ts: Date.now() });
+}
+
 function makeSSE(fn) {
   const { readable, writable } = new TransformStream();
   const w = writable.getWriter();
@@ -267,6 +294,23 @@ export default async function handler(req) {
   if (!groqKey) return new Response(JSON.stringify({ error: 'GROQ_API_KEY mancante' }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
   // Provider chain con fallback automatico
   const providers = getProviders(process.env);
+
+  // ── Routing intelligente: sceglie il modello migliore per il tipo di domanda
+  function selectBestModel(text) {
+    if (!text) return model;
+    // Mixtral: testi lunghi, codice, analisi dettagliate
+    if (/\b(scrivi|analizza|spiega.*dettagl|codice|programm|funzione|algoritmo|essay|articolo|relazione|riassunto lungo)\b/i.test(text)) {
+      return 'mixtral-8x7b-32768';
+    }
+    // Gemma: ragionamento logico, matematica, italiano preciso
+    if (/\b(perché|ragiona|confronta|differenza|vantaggio|svantaggio|pro.*contro|calcola|dimostra|argomenta)\b/i.test(text)) {
+      return 'gemma2-9b-it';
+    }
+    // Llama: default — tutto il resto
+    return model;
+  }
+  const smartModel = selectBestModel(userText);
+  if (smartModel !== model) console.log('[AInstAIn] Smart routing: ' + model + ' → ' + smartModel);
 
   const sseH = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
   const userText = getLastUserText(messages);
@@ -451,8 +495,31 @@ export default async function handler(req) {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // STREAMING NORMALE
+  // STREAMING NORMALE — Best-of-N default (3 modelli, giudice sintetizza)
+  // multiMode='fast' per risposta immediata, null/undefined = Best
   // ══════════════════════════════════════════════════════════════════════
+
+  // ── Controlla cache prima di tutto ───────────────────────────────────
+  if (!forceWeb) {
+    const cacheKey = getCacheKey(messages, smartModel);
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log('[AInstAIn] Cache HIT: ' + cacheKey.slice(0, 60));
+      const readable = makeSSE(async (send) => {
+        send({ type: 'meta', webSearchUsed: false });
+        for (let i = 0; i < cached.length; i += 4) send({ type: 'token', token: cached.slice(i, i+4) });
+        send({ type: 'done' });
+      });
+      return new Response(readable, { status: 200, headers: sseH });
+    }
+  }
+
+  // ── Best-of-N automatico (default) ───────────────────────────────────
+  // Fast mode: usa solo il modello principale in streaming
+  // Best mode (default): 3 modelli in parallelo + giudice
+  const isFastMode = multiMode === 'fast';
+
+  // ── Web Search (opzionale) ───────────────────────────────────────────
   let webCtx = '';
   const shouldSearch = tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
   if (shouldSearch) {
@@ -474,14 +541,79 @@ export default async function handler(req) {
   }
 
   try {
+    // ── Fast mode: streaming diretto con il modello principale ────────
+    if (isFastMode || shouldSearch) {
+      const readable = makeSSE(async (send) => {
+        send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
+        await streamWithFallback(providers, finalMsgs, maxTokens, temperature, smartModel,
+          tok => send({ type: 'token', token: tok }),
+          reason => send({ type: reason || 'done' })
+        );
+      });
+      return new Response(readable, { status: 200, headers: sseH });
+    }
+
+    // ── Best-of-N default: 3 modelli in parallelo + giudice ──────────
     const readable = makeSSE(async (send) => {
-      send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
-      await streamWithFallback(providers, finalMsgs, maxTokens, temperature, model,
-        tok => send({ type: 'token', token: tok }),
-        reason => send({ type: reason || 'done' })
+      send({ type: 'meta', webSearchUsed: false });
+      send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
+
+      // Chiama tutti e 3 i modelli in parallelo
+      const results = await Promise.allSettled(
+        MULTI_MODELS.map(m =>
+          callWithFallback([{ ...providers[0], model: m.id }], finalMsgs, Math.min(maxTokens, 768), temperature, m.id)
+            .then(r => ({ model: m.name, text: r.text }))
+        )
       );
+
+      const valid = results
+        .filter(r => r.status === 'fulfilled' && r.value && r.value.text)
+        .map(r => r.value);
+
+      console.log('[AInstAIn] Best-of-N: ' + valid.length + '/' + MULTI_MODELS.length + ' models responded');
+
+      if (valid.length === 0) { send({ type: 'error', message: 'Nessun modello ha risposto' }); return; }
+
+      // Con 1 sola risposta: usala direttamente
+      if (valid.length === 1) {
+        send({ type: 'multi_winner', model: valid[0].model });
+        for (let i = 0; i < valid[0].text.length; i += 4) send({ type: 'token', token: valid[0].text.slice(i, i+4) });
+        send({ type: 'done' });
+        return;
+      }
+
+      // Invia anteprime al client
+      send({ type: 'multi_responses', responses: valid.map(v => ({ model: v.model, preview: v.text.slice(0, 150) + '...' })) });
+
+      // Giudice: sintetizza la risposta migliore
+      const lastUserMsg = getLastUserText(finalMsgs);
+      const judgePrompt = 'Domanda originale: "' + lastUserMsg + '"\n\n' +
+        valid.map((v, i) => 'Risposta ' + (i+1) + ' (' + v.model + '):\n' + v.text).join('\n\n---\n\n') +
+        '\n\nScegli la risposta migliore o sintetizza il meglio di tutte. ' +
+        'Rispondi SOLO in italiano, in modo completo e preciso, senza citare i modelli.';
+
+      send({ type: 'multi_judging' });
+
+      const judgeResult = await callWithFallback(
+        [{ ...providers[0], model: JUDGE_MODEL }],
+        [
+          { role: 'system', content: 'Sei un sintetizzatore esperto. Produci sempre risposte in italiano, complete e accurate.' },
+          { role: 'user', content: judgePrompt }
+        ],
+        maxTokens, 0.3, JUDGE_MODEL
+      );
+      const synthesis = judgeResult.text;
+
+      // Salva in cache
+      const cacheKey = getCacheKey(finalMsgs, smartModel);
+      setCache(cacheKey, synthesis);
+
+      send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
+      for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i+4) });
+      send({ type: 'done' });
     });
     return new Response(readable, { status: 200, headers: sseH });
+
   } catch(e) {
     return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
   }
