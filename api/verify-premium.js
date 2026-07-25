@@ -1,7 +1,7 @@
 export const config = { runtime: 'edge' };
 
 import { SignJWT } from 'jose';
-import { premiumAttemptLimiter, getClientIp } from '../lib/rateLimit.js';
+import { premiumAttemptLimiter, getClientIp } from './lib/rateLimit.js';
 
 // Durata del token Premium: 180 giorni. Dopo la scadenza il frontend
 // mostrerà di nuovo il modale del codice (l'utente lo reinserisce una volta).
