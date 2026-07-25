@@ -1,5 +1,8 @@
 export const config = { runtime: 'edge' };
 
+import { jwtVerify } from 'jose';
+import { freeDailyLimiter, abuseLimiter, getClientIp } from '../lib/rateLimit.js';
+
 // ── Provider chain ────────────────────────────────────────────────────
 const PROVIDER_CHAIN = [
   { name: 'Groq',       url: 'https://api.groq.com/openai/v1/chat/completions',       model: 'llama-3.3-70b-versatile',                    keyEnv: 'GROQ_API_KEY' },
@@ -98,6 +101,23 @@ function makeSSE(fn) {
   return readable;
 }
 
+// ── NUOVO: validazione Premium server-side ────────────────────────────
+// Verifica il JWT firmato da api/verify-premium.js. Non ci fidiamo più
+// di un flag mandato dal client: se il token manca, è scaduto o è
+// firmato male, l'utente viene trattato come Free.
+async function verifyPremiumToken(req) {
+  const auth = req.headers.get('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token || !process.env.JWT_SECRET) return false;
+  try {
+    const secretKey = new TextEncoder().encode(process.env.JWT_SECRET);
+    const { payload } = await jwtVerify(token, secretKey);
+    return payload.premium === true;
+  } catch {
+    return false; // token assente, scaduto o manomesso
+  }
+}
+
 // ── Chiamata non-streaming con fallback ───────────────────────────────
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
   for (const p of providers) {
@@ -162,9 +182,33 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
 
 // ════════════════════════════════════════════════════════════════════════
 export default async function handler(req) {
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
   if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: cors });
   if (req.method !== 'POST')  return new Response('Method not allowed', { status: 405, headers: cors });
+
+  // ── NUOVO: chi è davvero questo utente? (verifica server-side, non fidarsi del client) ──
+  const isPremiumServer = await verifyPremiumToken(req);
+  const clientIp = getClientIp(req);
+
+  // ── NUOVO: rate limit anti-abuso, per IP, vale per TUTTI (anche Premium) ──
+  const abuseCheck = await abuseLimiter.limit(clientIp);
+  if (!abuseCheck.success) {
+    return new Response(JSON.stringify({ error: 'Troppe richieste in poco tempo. Rallenta un attimo.', rateLimited: true }), {
+      status: 429, headers: { ...cors, 'Content-Type': 'application/json' },
+    });
+  }
+
+  // ── NUOVO: tetto giornaliero solo per utenti Free (i Premium non hanno questo limite) ──
+  if (!isPremiumServer) {
+    const freeCheck = await freeDailyLimiter.limit(clientIp);
+    if (!freeCheck.success) {
+      return new Response(JSON.stringify({
+        error: 'Hai raggiunto il limite giornaliero di messaggi Free. Passa a Premium per continuare senza limiti.',
+        rateLimited: true,
+        limitReached: true,
+      }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
+    }
+  }
 
   let body;
   try { body = JSON.parse(await req.text()); }
@@ -172,9 +216,11 @@ export default async function handler(req) {
 
   const messages    = body.messages || [];
   const model       = body.model || 'llama-3.3-70b-versatile';
-  const forceWeb    = body.webSearch === true;
+  // ── NUOVO: forceWeb e multiMode sono feature Premium. Anche se il client
+  // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
+  const forceWeb    = isPremiumServer && body.webSearch === true;
   const agentMode   = body.agentMode === true;
-  const multiMode   = body.multiMode || null;
+  const multiMode   = isPremiumServer ? (body.multiMode || null) : null;
   const temperature = body.temperature != null ? body.temperature : 0.7;
   const maxTokens   = body.max_tokens || 4096;
 
@@ -187,7 +233,7 @@ export default async function handler(req) {
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
-  console.log('[AI] agentMode=' + agentMode + ' multiMode=' + multiMode + ' smartModel=' + smartModel);
+  console.log('[AI] premium=' + isPremiumServer + ' agentMode=' + agentMode + ' multiMode=' + multiMode + ' smartModel=' + smartModel);
 
   // ══════════════════════════════════════════════════════════════════════
   // BRANCH: MULTI-LLM (Fast o Best)
