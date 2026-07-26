@@ -1,4 +1,4 @@
-export const config = { runtime: 'edge' };
+export const config = { runtime: 'edge', maxDuration: 60 };
 
 import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from '../lib/rateLimit.js';
