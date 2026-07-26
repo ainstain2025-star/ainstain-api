@@ -1,7 +1,7 @@
 export const config = { runtime: 'edge' };
 
 import { jwtVerify } from 'jose';
-import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
+import { freeDailyLimiter, abuseLimiter, getClientIp } from '../lib/rateLimit.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
 const PROVIDER_CHAIN = [
@@ -97,7 +97,18 @@ function makeSSE(fn) {
   const w = writable.getWriter();
   const enc = new TextEncoder();
   const send = obj => w.write(enc.encode('data: ' + JSON.stringify(obj) + '\n\n'));
-  (async () => { try { await fn(send); } finally { w.close(); } })();
+  (async () => {
+    try {
+      await fn(send);
+    } catch (e) {
+      // FIX: prima, se fn() falliva (es. tutti i provider AI non disponibili),
+      // lo stream si chiudeva silenziosamente senza mandare nulla al client,
+      // che restava con una bolla vuota senza nessun messaggio di errore.
+      try { send({ type: 'error', message: e && e.message ? e.message : 'Errore imprevisto del server.' }); } catch {}
+    } finally {
+      w.close();
+    }
+  })();
   return readable;
 }
 
