@@ -74,7 +74,12 @@ function getLastUserText(messages) {
   return m ? extractText(m.content) : '';
 }
 function buildPollinationsUrl(prompt) {
-  return 'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?width=1024&height=1024&nologo=true&model=flux';
+  // referrer: metodo di autenticazione ufficiale per app web (nessuna
+  // registrazione necessaria) — migliora il riconoscimento del rate limit.
+  // enhance=true: un modello lato Pollinations arricchisce il prompt prima
+  // della generazione, aiuta con anatomia/proporzioni.
+  const seed = Math.floor(Math.random() * 1000000);
+  return 'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?width=1024&height=1024&nologo=true&model=flux&enhance=true&seed=' + seed + '&referrer=ainstain.site';
 }
 
 async function tavilySearch(query, apiKey) {
@@ -245,6 +250,26 @@ export default async function handler(req) {
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
   console.log('[AI] premium=' + isPremiumServer + ' agentMode=' + agentMode + ' multiMode=' + multiMode + ' smartModel=' + smartModel);
+
+  // ══════════════════════════════════════════════════════════════════════
+  // BRANCH: NON-STREAMING (risposta JSON diretta, non SSE)
+  // Usato per compiti "di supporto" veloci: titolo automatico chat,
+  // miglioramento prompt per generazione immagini, ecc.
+  // FIX: prima questo branch non esisteva — qualsiasi richiesta con
+  // stream:false riceveva comunque uno stream SSE, che il client provava
+  // a leggere con res.json() fallendo silenziosamente (es. il titolo
+  // automatico delle chat non ha mai funzionato per questo motivo).
+  // ══════════════════════════════════════════════════════════════════════
+  if (body.stream === false && !multiMode && !agentMode) {
+    try {
+      const result = await callWithFallback(providers, messages, maxTokens, temperature, smartModel);
+      return new Response(JSON.stringify({ choices: [{ message: { content: result.text } }] }), {
+        status: 200, headers: { ...cors, 'Content-Type': 'application/json' }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
+    }
+  }
 
   // ══════════════════════════════════════════════════════════════════════
   // BRANCH: MULTI-LLM (Fast o Best)
