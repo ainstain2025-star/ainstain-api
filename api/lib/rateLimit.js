@@ -9,6 +9,9 @@ import { Redis } from '@upstash/redis';
 
 const redis = Redis.fromEnv();
 
+// Esportato per riuso diretto (es. api/track-visit.js, api/visits.js)
+export { redis };
+
 // Limite giornaliero per utenti Free (allineato al FREE_MSG_LIMIT del frontend).
 export const freeDailyLimiter = new Ratelimit({
   redis,
