@@ -1,6 +1,6 @@
 export const config = { runtime: 'edge' };
 
-import { redis } from '../lib/rateLimit.js';
+import { redis } from './lib/rateLimit.js';
 
 // Endpoint di sola consultazione, protetto da una chiave segreta
 // (env var VISITS_ADMIN_KEY). Non è collegato a nessun pulsante o
