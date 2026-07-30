@@ -1,6 +1,6 @@
 export const config = { runtime: 'edge' };
 
-import { redis } from '../lib/rateLimit.js';
+import { redis } from './lib/rateLimit.js';
 
 // Registra una visita: incrementa un contatore totale e uno per la
 // giornata odierna. Nessun dato personale salvato — solo numeri
