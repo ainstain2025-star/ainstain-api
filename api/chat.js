@@ -26,10 +26,82 @@ const WEB_TRIGGERS = [
   /\b(borsa|azioni|bitcoin|crypto|euro|dollaro)\b/i,
   /\b(elezioni|governo|presidente|premier|ministro)\b/i,
 ];
-const CALC_RE    = /(quanto\s+fa\s+|calcola\s+|\d+\s*%\s*di\s*\d+|(?<!\d{3})\d{1,3}\s*[+*/]\s*\d+(?!\d)|\b\d{1,3}\s*-\s*\d{1,3}\b(?!\s*\d))/i;
-const IMAGE_RE   = /\b(genera|crea|disegna|illustra|mostrami|dipingi|produci)\s+(un[ao]?\s+)?(immagine|foto|illustrazione|dipinto|disegno|artwork|wallpaper|poster|logo)/i;
-const DATETIME_RE= /\b(che ore|che giorno|che data|oggi è|giorno è|ora è|data oggi|orario)\b/i;
-const REMEMBER_RE= /\b(ricorda che|memorizza|salva che|tieni a mente)\b/i;
+// Le regex CALC_RE/IMAGE_RE/DATETIME_RE/REMEMBER_RE del vecchio dispatcher
+// a singolo tool non servono più: ora è l'AI stessa a scegliere lo
+// strumento leggendo la descrizione nel prompt del loop ReAct (vedi sotto).
+
+// ── LOOP ReAct: istruzioni, parsing, esecuzione strumenti ─────────────
+// Non usiamo il tool-calling nativo di Groq (in passato causava bug di
+// formato) — l'agente ragiona in testo strutturato che analizziamo noi:
+// classico schema ReAct (Thought → Action → Observation, ripetuto) usato
+// dai framework agentici prima dell'arrivo del function-calling nativo.
+const MAX_REACT_STEPS = 8;
+
+function buildReActSystemPrompt(baseSystemPrompt) {
+  return baseSystemPrompt + `
+
+---
+MODALITÀ AGENTE (ragionamento multi-step). Risolvi la richiesta ragionando passo dopo passo.
+
+Strumenti disponibili:
+- web_search: cerca informazioni aggiornate sul web. Input: la query di ricerca.
+- get_current_datetime: restituisce data e ora attuali. Input: scrivi "-" (non serve altro).
+- calculate: esegue un calcolo matematico. Input: l'espressione da calcolare.
+- remember: salva un'informazione permanente sull'utente. Input: l'informazione da salvare.
+- generate_image: genera un'immagine (termina sempre il turno). Input: descrizione dell'immagine.
+
+Per OGNI passo rispondi ESATTAMENTE in uno di questi due formati, niente altro testo prima o dopo:
+
+Per usare uno strumento:
+THOUGHT: <ragionamento breve, una frase>
+ACTION: <nome esatto dello strumento>
+ACTION_INPUT: <input per lo strumento>
+
+Per dare la risposta finale (quando hai già tutte le informazioni necessarie):
+THOUGHT: <ragionamento breve>
+FINAL_ANSWER: <risposta completa e ben scritta per l'utente, in italiano>
+
+Regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se non ti servono strumenti, vai direttamente a FINAL_ANSWER dal primo passo. Hai al massimo ${MAX_REACT_STEPS} passi totali.
+---`;
+}
+
+function parseReActStep(text) {
+  const t = text || '';
+  const thoughtMatch = t.match(/THOUGHT:\s*([\s\S]*?)(?=\n(?:ACTION|FINAL_ANSWER):|$)/i);
+  const thought = thoughtMatch ? thoughtMatch[1].trim() : '';
+  const finalMatch = t.match(/FINAL_ANSWER:\s*([\s\S]*)/i);
+  if (finalMatch) return { thought, finalAnswer: finalMatch[1].trim() };
+  const actionMatch = t.match(/ACTION:\s*([a-zA-Z_]+)/i);
+  const inputMatch  = t.match(/ACTION_INPUT:\s*([\s\S]*)/i);
+  if (actionMatch) return { thought, action: actionMatch[1].trim(), actionInput: inputMatch ? inputMatch[1].trim() : '' };
+  // Formato non riconosciuto: trattalo come risposta finale invece di bloccare il loop
+  return { thought, finalAnswer: t.trim() };
+}
+
+async function executeReActTool(name, input, ctx) {
+  switch (name) {
+    case 'get_current_datetime': {
+      const now = new Date();
+      return now.toLocaleString('it-IT', { weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short' });
+    }
+    case 'calculate': {
+      try {
+        const expr = (input || '').replace(/(\d+(?:[.,]\d+)?)\s*%\s*di\s*(\d+(?:[.,]\d+)?)/gi, (_,a,b) => '('+a.replace(',','.')+'/100*'+b.replace(',','.')+')').replace(/[^0-9+\-*/().,]/g,' ').trim();
+        const result = Function('"use strict"; return (' + expr + ')')();
+        return 'Risultato: ' + result;
+      } catch { return 'Impossibile calcolare questa espressione.'; }
+    }
+    case 'remember':
+      return 'Informazione salvata: "' + (input || '') + '"';
+    case 'web_search': {
+      if (!ctx.tavilyKey) return 'Ricerca web non disponibile in questo momento.';
+      try { return await tavilySearch((input || '').slice(0, 150), ctx.tavilyKey); }
+      catch (e) { return 'Ricerca fallita: ' + e.message; }
+    }
+    default:
+      return 'Strumento "' + name + '" non riconosciuto.';
+  }
+}
 
 // ── Cache risposte ────────────────────────────────────────────────────
 const responseCache = new Map();
@@ -336,71 +408,70 @@ export default async function handler(req) {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  // BRANCH: AGENTE
+  // BRANCH: AGENTE (loop ReAct multi-step — max MAX_REACT_STEPS passi)
   // ══════════════════════════════════════════════════════════════════════
   if (agentMode) {
     const readable = makeSSE(async (send) => {
-      send({ type: 'meta', webSearchUsed: false });
-      let toolContext = '', toolUsed = null;
+      const sys = messages.find(m => m.role === 'system');
+      const baseSystemPrompt = sys ? sys.content : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
+      const reactSystemPrompt = buildReActSystemPrompt(baseSystemPrompt);
 
-      if (DATETIME_RE.test(userText)) {
-        toolUsed = 'get_current_datetime';
-        send({ type: 'agent_step', step: 1, max: 2 });
-        send({ type: 'agent_tools', tools: ['get_current_datetime'] });
-        const now = new Date();
-        toolContext = '\n\n[TOOL: get_current_datetime]\n' + now.toLocaleString('it-IT', { weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short' }) + '\n[/TOOL]\n\nUsa questa informazione per rispondere.';
-      }
-      else if (CALC_RE.test(userText)) {
-        toolUsed = 'calculate';
-        send({ type: 'agent_step', step: 1, max: 2 });
-        send({ type: 'agent_tools', tools: ['calculate'] });
+      let reactMessages = [{ role: 'system', content: reactSystemPrompt }, ...messages.filter(m => m.role !== 'system')];
+      let usedWeb = false;
+      let finalAnswer = null;
+
+      for (let step = 1; step <= MAX_REACT_STEPS; step++) {
+        send({ type: 'agent_step', step, max: MAX_REACT_STEPS });
+
+        let stepText;
         try {
-          const expr = userText.replace(/(\d+(?:[.,]\d+)?)\s*%\s*di\s*(\d+(?:[.,]\d+)?)/gi, (_,a,b) => '('+a.replace(',','.')+'/100*'+b.replace(',','.')+')').replace(/[^0-9+\-*/().,]/g,' ').trim();
-          const result = Function('"use strict"; return (' + expr + ')')();
-          toolContext = '\n\n[TOOL: calculate]\nRisultato: ' + result + '\n[/TOOL]\n\nUsa questo risultato per rispondere.';
-        } catch(e) { toolContext = '\n\n[TOOL: calculate]\nImpossibile calcolare. Spiega come farlo.\n[/TOOL]'; }
-      }
-      else if (REMEMBER_RE.test(userText)) {
-        toolUsed = 'remember';
-        send({ type: 'agent_step', step: 1, max: 2 });
-        send({ type: 'agent_tools', tools: ['remember'] });
-        const note = userText.replace(REMEMBER_RE, '').trim();
-        toolContext = '\n\n[TOOL: remember]\nInformazione salvata: "' + note + '"\n[/TOOL]\n\nConferma all\'utente che hai salvato questa informazione.';
-        send({ type: 'agent_saved', note });
-      }
-      else if (IMAGE_RE.test(userText)) {
-        send({ type: 'agent_step', step: 1, max: 1 });
-        send({ type: 'agent_tools', tools: ['generate_image'] });
-        const imgPrompt = userText.replace(IMAGE_RE, '').replace(/^[\s,.:]+/, '').trim() || userText;
-        send({ type: 'agent_image', url: buildPollinationsUrl(imgPrompt + ', high quality, detailed, artistic'), prompt: imgPrompt });
-        send({ type: 'done' }); return;
-      }
-      else if (tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)))) {
-        toolUsed = 'web_search';
-        send({ type: 'agent_step', step: 1, max: 2 });
-        send({ type: 'agent_tools', tools: ['web_search'] });
-        try {
-          const results = await tavilySearch(userText.slice(0, 150) + ' ' + new Date().getFullYear(), tavilyKey);
-          const today = new Date().toLocaleDateString('it-IT', { day:'2-digit', month:'long', year:'numeric' });
-          toolContext = '\n\n[TOOL: web_search - ' + today + ']\n' + results + '\n[/TOOL]\n\nUsa questi risultati aggiornati per rispondere. Cita le fonti.';
-        } catch(e) { toolContext = '\n\n[TOOL: web_search]\nRicerca non disponibile: ' + e.message + '\n[/TOOL]'; }
+          const r = await callWithFallback(providers, reactMessages, 700, 0.3, model);
+          stepText = r.text;
+        } catch (e) {
+          send({ type: 'error', message: e.message });
+          return;
+        }
+
+        const parsed = parseReActStep(stepText);
+        if (parsed.thought) send({ type: 'agent_thought', thought: parsed.thought, step });
+
+        // Risposta finale: il loop termina qui
+        if (parsed.finalAnswer) { finalAnswer = parsed.finalAnswer; break; }
+
+        // Generazione immagine: termina sempre il turno (comportamento invariato rispetto a prima)
+        if (parsed.action === 'generate_image') {
+          send({ type: 'agent_tools', tools: ['generate_image'] });
+          const imgPrompt = parsed.actionInput || userText;
+          send({ type: 'agent_image', url: buildPollinationsUrl(imgPrompt + ', high quality, detailed, artistic'), prompt: imgPrompt });
+          return;
+        }
+
+        if (parsed.action) {
+          send({ type: 'agent_tools', tools: [parsed.action] });
+          if (parsed.action === 'remember') send({ type: 'agent_saved', note: parsed.actionInput });
+          if (parsed.action === 'web_search') usedWeb = true;
+
+          const observation = await executeReActTool(parsed.action, parsed.actionInput, { tavilyKey });
+          send({ type: 'agent_observation', tool: parsed.action, observation: String(observation).slice(0, 300) });
+
+          // Aggiungi il passo (ragionamento+azione dell'assistente, poi l'osservazione)
+          // alla conversazione, cosi il prossimo step del loop li vede entrambi.
+          reactMessages.push({ role: 'assistant', content: stepText });
+          reactMessages.push({ role: 'user', content: 'OBSERVATION: ' + observation + '\n\n(Continua il ragionamento. Se hai già abbastanza informazioni, rispondi con FINAL_ANSWER.)' });
+        } else {
+          // Non dovrebbe succedere (parseReActStep ha sempre un fallback), ma per sicurezza:
+          finalAnswer = stepText;
+          break;
+        }
       }
 
-      send({ type: 'agent_step', step: toolUsed ? 2 : 1, max: toolUsed ? 2 : 1 });
-      let finalMsgs = [...messages];
-      if (toolContext) {
-        const sys = finalMsgs.find(m => m.role === 'system');
-        const base = sys ? sys.content : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
-        const si = finalMsgs.findIndex(m => m.role === 'system');
-        if (si !== -1) finalMsgs[si] = { ...finalMsgs[si], content: base + toolContext };
-        else finalMsgs.unshift({ role: 'system', content: base + toolContext });
+      if (!finalAnswer) {
+        finalAnswer = '⚠️ Ho raggiunto il limite di ' + MAX_REACT_STEPS + ' passaggi senza arrivare a una risposta definitiva. Prova a riformulare la richiesta in modo più specifico.';
       }
-      try {
-        await streamWithFallback(providers, finalMsgs, maxTokens, temperature, model,
-          tok => send({ type: 'token', token: tok }),
-          reason => send({ type: reason || 'done' })
-        );
-      } catch(e) { send({ type: 'error', message: e.message }); }
+
+      send({ type: 'meta', webSearchUsed: usedWeb });
+      for (let i = 0; i < finalAnswer.length; i += 4) send({ type: 'token', token: finalAnswer.slice(i, i + 4) });
+      send({ type: 'done' });
     });
     return new Response(readable, { status: 200, headers: sseH });
   }
