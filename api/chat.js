@@ -45,7 +45,7 @@ MODALITÀ AGENTE (ragionamento multi-step). Risolvi la richiesta ragionando pass
 
 Strumenti disponibili:
 - web_search: cerca informazioni aggiornate sul web. Input: la query di ricerca.
-- get_current_datetime: restituisce data e ora attuali. Input: scrivi "-" (non serve altro).
+- get_current_datetime: restituisce data e ora attuali in UTC. Input: scrivi "-" (non serve altro). Se l'utente ha bisogno dell'ora nel suo fuso orario locale (non UTC) e non l'ha già indicato nella conversazione, NON calcolarla a caso: chiedigli prima in che città o fuso orario si trova, poi calcola tu la conversione da UTC una volta che te lo dice.
 - calculate: esegue un calcolo matematico. Input: l'espressione da calcolare.
 - remember: salva un'informazione permanente sull'utente. Input: l'informazione da salvare.
 - generate_image: genera un'immagine (termina sempre il turno). Input: descrizione dell'immagine.
@@ -82,7 +82,7 @@ async function executeReActTool(name, input, ctx) {
   switch (name) {
     case 'get_current_datetime': {
       const now = new Date();
-      return now.toLocaleString('it-IT', { weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short' });
+      return now.toLocaleString('it-IT', { timeZone: 'UTC', weekday:'long',year:'numeric',month:'long',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit' }) + ' UTC';
     }
     case 'calculate': {
       try {
@@ -503,7 +503,7 @@ export default async function handler(req) {
       const q = userText.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
       const r = await tavilySearch(q, tavilyKey);
       if (r) {
-        const today = new Date().toLocaleDateString('it-IT', { day:'2-digit', month:'long', year:'numeric' });
+        const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
         webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni. Cita le fonti.';
       }
     } catch(e) { console.error('Tavily:', e.message); }
