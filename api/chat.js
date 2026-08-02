@@ -278,23 +278,38 @@ export default async function handler(req) {
   const isPremiumServer = await verifyPremiumToken(req);
   const clientIp = getClientIp(req);
 
+  // FIX: prima, se Upstash Redis aveva anche un piccolo intoppo momentaneo,
+  // questi controlli non gestiti mandavano in crash l'intera funzione con
+  // un errore 500 grezzo — capitava su QUALSIASI richiesta, semplice o
+  // complessa, in modo imprevedibile. "Fail open": se il rate limiter
+  // stesso non risponde, la richiesta passa comunque (meglio permettere
+  // un abuso occasionale che bloccare tutti per un problema tecnico).
+
   // ── NUOVO: rate limit anti-abuso, per IP, vale per TUTTI (anche Premium) ──
-  const abuseCheck = await abuseLimiter.limit(clientIp);
-  if (!abuseCheck.success) {
-    return new Response(JSON.stringify({ error: 'Troppe richieste in poco tempo. Rallenta un attimo.', rateLimited: true }), {
-      status: 429, headers: { ...cors, 'Content-Type': 'application/json' },
-    });
+  try {
+    const abuseCheck = await abuseLimiter.limit(clientIp);
+    if (!abuseCheck.success) {
+      return new Response(JSON.stringify({ error: 'Troppe richieste in poco tempo. Rallenta un attimo.', rateLimited: true }), {
+        status: 429, headers: { ...cors, 'Content-Type': 'application/json' },
+      });
+    }
+  } catch (e) {
+    console.log('[ratelimit] abuseLimiter non disponibile, richiesta passata comunque:', e.message);
   }
 
   // ── NUOVO: tetto giornaliero solo per utenti Free (i Premium non hanno questo limite) ──
   if (!isPremiumServer) {
-    const freeCheck = await freeDailyLimiter.limit(clientIp);
-    if (!freeCheck.success) {
-      return new Response(JSON.stringify({
-        error: 'Hai raggiunto il limite giornaliero di messaggi Free. Passa a Premium per continuare senza limiti.',
-        rateLimited: true,
-        limitReached: true,
-      }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
+    try {
+      const freeCheck = await freeDailyLimiter.limit(clientIp);
+      if (!freeCheck.success) {
+        return new Response(JSON.stringify({
+          error: 'Hai raggiunto il limite giornaliero di messaggi Free. Passa a Premium per continuare senza limiti.',
+          rateLimited: true,
+          limitReached: true,
+        }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
+      }
+    } catch (e) {
+      console.log('[ratelimit] freeDailyLimiter non disponibile, richiesta passata comunque:', e.message);
     }
   }
 
