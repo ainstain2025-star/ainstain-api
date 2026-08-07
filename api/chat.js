@@ -208,15 +208,30 @@ async function verifyPremiumToken(req) {
 
 // ── Chiamata non-streaming con fallback ───────────────────────────────
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
-  for (const p of providers) {
+  for (let i = 0; i < providers.length; i++) {
+    const p = providers[i];
+    // FIX BUG CRITICO: prima "model || p.model" usava lo stesso nome
+    // modello per TUTTI i provider — ma ogni provider ha una propria
+    // nomenclatura (es. Groq: "llama-3.3-70b-versatile", OpenRouter:
+    // "meta-llama/llama-3.3-70b-instruct:free"). Quando Groq falliva e
+    // scattava il fallback su OpenRouter, gli veniva chiesto un modello
+    // che non esiste per lui → OpenRouter rispondeva 400, il fallback
+    // falliva del tutto, e l'utente vedeva un errore 500 grezzo.
+    // Ora l'override personalizzato (es. da selectBestModel) si applica
+    // SOLO al provider principale (il primo, Groq); i provider di
+    // riserva usano sempre il proprio nome modello corretto.
+    const useModel = i === 0 ? (model || p.model) : p.model;
     try {
       const res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: model || p.model, messages, max_tokens: maxTokens, temperature, stream: false }),
+        body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: false }),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
-      if (!res.ok) throw new Error(p.name + ' error ' + res.status);
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        throw new Error(p.name + ' error ' + res.status + (errBody ? ' — ' + errBody.slice(0, 200) : ''));
+      }
       const data = await res.json();
       const text = data.choices?.[0]?.message?.content || '';
       console.log('[AI] callWithFallback: used ' + p.name);
@@ -231,12 +246,14 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 
 // ── Streaming con fallback ────────────────────────────────────────────
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
-  for (const p of providers) {
+  for (let i = 0; i < providers.length; i++) {
+    const p = providers[i];
+    const useModel = i === 0 ? (model || p.model) : p.model; // stesso fix di callWithFallback
     try {
       const res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: model || p.model, messages, max_tokens: maxTokens, temperature, stream: true }),
+        body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: true }),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
       if (!res.ok) { const e = await res.text(); if (res.status === 429) continue; throw new Error(p.name + ': ' + e); }
