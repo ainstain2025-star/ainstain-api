@@ -4,9 +4,19 @@ import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
+// NOTA su OpenRouter (fallback): il catalogo dei modelli gratuiti cambia
+// spesso, anche senza preavviso — a inizio agosto 2026 hanno eliminato
+// l'intero livello gratuito Llama (compreso quello usato qui prima),
+// causando un errore 404/400 ogni volta che scattava il fallback.
+// "openrouter/free" è il selettore automatico ufficiale di OpenRouter:
+// sceglie da solo un modello gratuito disponibile in quel momento,
+// così il fallback non si rompe più se un modello specifico sparisce
+// dal loro catalogo. Compromesso accettato: la risposta del fallback
+// può variare leggermente di modello in modello — accettabile perché
+// OpenRouter qui è solo la riserva, non il provider principale.
 const PROVIDER_CHAIN = [
   { name: 'Groq',       url: 'https://api.groq.com/openai/v1/chat/completions',       model: 'llama-3.3-70b-versatile',                    keyEnv: 'GROQ_API_KEY' },
-  { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',          model: 'meta-llama/llama-3.3-70b-instruct:free',     keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
+  { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',          model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
 
 const MULTI_MODELS = [
