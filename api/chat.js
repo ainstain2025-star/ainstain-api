@@ -56,7 +56,7 @@ MODALITÀ AGENTE (ragionamento multi-step). Risolvi la richiesta ragionando pass
 Strumenti disponibili:
 - web_search: cerca informazioni aggiornate sul web. Input: la query di ricerca.
 - get_current_datetime: restituisce data e ora attuali in UTC. Input: scrivi "-" (non serve altro). Se l'utente ha bisogno dell'ora nel suo fuso orario locale (non UTC) e non l'ha già indicato nella conversazione, NON calcolarla a caso: chiedigli prima in che città o fuso orario si trova, poi calcola tu la conversione da UTC una volta che te lo dice.
-- calculate: esegue un calcolo matematico. Input: l'espressione da calcolare.
+- calculate: esegue un calcolo matematico VERO (es. "150 * 0.20", "34 + 12"). NON usarlo per domande di comprensione testuale che contengono solo numeri/importi/date come parte del testo (es. scegliere l'opzione corretta tra alternative, confrontare due frasi, verificare una trascrizione) — quelle si risolvono ragionando, non calcolando.
 - remember: salva un'informazione permanente sull'utente. Input: l'informazione da salvare.
 - generate_image: genera un'immagine (termina sempre il turno). Input: descrizione dell'immagine.
 
@@ -71,7 +71,9 @@ Per dare la risposta finale (quando hai già tutte le informazioni necessarie):
 THOUGHT: <ragionamento breve>
 FINAL_ANSWER: <risposta completa e ben scritta per l'utente, in italiano>
 
-Regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se non ti servono strumenti, vai direttamente a FINAL_ANSWER dal primo passo. Hai al massimo ${MAX_REACT_STEPS} passi totali.
+REGOLA PIÙ IMPORTANTE: la maggior parte delle domande NON richiede nessuno strumento — domande di conoscenza generale, ragionamento, scelta multipla, confronto tra testi, opinioni, spiegazioni, scrittura creativa, ecc. vanno risolte SUBITO con FINAL_ANSWER al primo passo. Usa uno strumento SOLO se ti serve davvero un dato che non hai (es. informazioni aggiornate dal web, data/ora reale, un calcolo aritmetico vero, salvare un ricordo). Nel dubbio, preferisci rispondere direttamente piuttosto che usare uno strumento inutile.
+
+Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione, anche se non perfetto. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
 ---`;
 }
 
@@ -461,6 +463,7 @@ export default async function handler(req) {
       let reactMessages = [{ role: 'system', content: reactSystemPrompt }, ...messages.filter(m => m.role !== 'system')];
       let usedWeb = false;
       let finalAnswer = null;
+      let lastActionSignature = null;
 
       for (let step = 1; step <= MAX_REACT_STEPS; step++) {
         send({ type: 'agent_step', step, max: MAX_REACT_STEPS });
@@ -496,10 +499,24 @@ export default async function handler(req) {
           const observation = await executeReActTool(parsed.action, parsed.actionInput, { tavilyKey });
           send({ type: 'agent_observation', tool: parsed.action, observation: String(observation).slice(0, 300) });
 
+          // Guardia anti-loop: se l'azione è identica alla precedente, avvisa
+          // esplicitamente invece di lasciare che l'AI la ripeta all'infinito
+          // fino a esaurire tutti i passaggi disponibili.
+          const actionSignature = parsed.action + '::' + parsed.actionInput;
+          const isRepeat = actionSignature === lastActionSignature;
+          lastActionSignature = actionSignature;
+
           // Aggiungi il passo (ragionamento+azione dell'assistente, poi l'osservazione)
           // alla conversazione, cosi il prossimo step del loop li vede entrambi.
           reactMessages.push({ role: 'assistant', content: stepText });
-          reactMessages.push({ role: 'user', content: 'OBSERVATION: ' + observation + '\n\n(Continua il ragionamento. Se hai già abbastanza informazioni, rispondi con FINAL_ANSWER.)' });
+          reactMessages.push({
+            role: 'user',
+            content: 'OBSERVATION: ' + observation + '\n\n' + (
+              isRepeat
+                ? '(Hai già provato questa stessa azione con lo stesso input: non aiuta a procedere. NON ripeterla di nuovo — rispondi ORA con FINAL_ANSWER usando il tuo miglior giudizio con le informazioni che hai.)'
+                : '(Continua il ragionamento. Se hai già abbastanza informazioni, rispondi con FINAL_ANSWER.)'
+            )
+          });
         } else {
           // Non dovrebbe succedere (parseReActStep ha sempre un fallback), ma per sicurezza:
           finalAnswer = stepText;
@@ -508,7 +525,22 @@ export default async function handler(req) {
       }
 
       if (!finalAnswer) {
-        finalAnswer = '⚠️ Ho raggiunto il limite di ' + MAX_REACT_STEPS + ' passaggi senza arrivare a una risposta definitiva. Prova a riformulare la richiesta in modo più specifico.';
+        // FIX: prima, se si esauriva il limite di passaggi, l'utente vedeva
+        // solo un messaggio di resa ("non sono arrivato a una risposta").
+        // Ora, invece di arrendersi, si fa un ultimo tentativo: si chiede
+        // all'AI di sintetizzare la MIGLIOR risposta possibile con tutto
+        // quello che ha raccolto finora, fuori dal formato ReAct (una
+        // risposta diretta è sempre meglio di nessuna risposta).
+        try {
+          const synthesisMessages = [
+            { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, in italiano, usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat.' },
+            ...reactMessages.filter(m => m.role !== 'system')
+          ];
+          const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, model);
+          finalAnswer = synthResult.text;
+        } catch (e) {
+          finalAnswer = '⚠️ Ho ragionato a lungo su questa richiesta senza arrivare a una conclusione netta. Prova a riformulare la richiesta in modo più specifico, o disattiva la modalità Agente per una risposta diretta.';
+        }
       }
 
       send({ type: 'meta', webSearchUsed: usedWeb });
