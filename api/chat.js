@@ -19,10 +19,17 @@ const PROVIDER_CHAIN = [
   { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',          model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
 
+// NOTA 2026-08-23: gemma2-9b-it (deprecato ott. 2025) e mixtral-8x7b-32768
+// (deprecato mar. 2025) erano usati qui ma non più disponibili su Groq da
+// mesi — la modalità Multi-AI girava di fatto con un solo modello su 3,
+// in modo silenzioso (Promise.allSettled scarta i falliti senza errore
+// visibile). Sostituiti con GPT-OSS 120B/20B, modelli attualmente attivi
+// (verificato su console.groq.com/docs/models), diversi da Llama per una
+// vera diversità di "opinioni" nel confronto Best-of-N.
 const MULTI_MODELS = [
-  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3' },
-  { id: 'gemma2-9b-it',            name: 'Gemma 2'   },
-  { id: 'mixtral-8x7b-32768',      name: 'Mixtral'   },
+  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3'   },
+  { id: 'openai/gpt-oss-120b',     name: 'GPT-OSS 120B' },
+  { id: 'openai/gpt-oss-20b',      name: 'GPT-OSS 20B'  },
 ];
 const JUDGE_MODEL = 'llama-3.1-8b-instant';
 
@@ -142,8 +149,13 @@ function setCache(key, text) {
 // ── Routing intelligente ──────────────────────────────────────────────
 function selectBestModel(text, defaultModel) {
   if (!text) return defaultModel;
-  if (/\b(scrivi|analizza|spiega.*dettagl|codice|programm|funzione|algoritmo|essay|articolo|relazione|riassunto lungo)\b/i.test(text)) return 'mixtral-8x7b-32768';
-  if (/\b(perché|ragiona|confronta|differenza|vantaggio|svantaggio|pro.*contro|calcola|dimostra|argomenta)\b/i.test(text)) return 'gemma2-9b-it';
+  // NOTA 2026-08-23: mixtral-8x7b-32768 e gemma2-9b-it (deprecati, non più
+  // disponibili su Groq) sostituiti con GPT-OSS 120B/20B — vedi nota sopra
+  // su MULTI_MODELS per i dettagli. Questo bug faceva sì che OGNI richiesta
+  // di codice fallisse su Groq (modello inesistente) e cadesse sempre sul
+  // fallback OpenRouter, più lento — invisibile all'utente ma reale.
+  if (/\b(scrivi|analizza|spiega.*dettagl|codice|programm|funzione|algoritmo|essay|articolo|relazione|riassunto lungo)\b/i.test(text)) return 'openai/gpt-oss-120b';
+  if (/\b(perché|ragiona|confronta|differenza|vantaggio|svantaggio|pro.*contro|calcola|dimostra|argomenta)\b/i.test(text)) return 'openai/gpt-oss-20b';
   return defaultModel;
 }
 
