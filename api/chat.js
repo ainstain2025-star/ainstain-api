@@ -61,7 +61,7 @@ function buildReActSystemPrompt(baseSystemPrompt) {
 MODALITÀ AGENTE (ragionamento multi-step). Risolvi la richiesta ragionando passo dopo passo.
 
 Strumenti disponibili:
-- web_search: cerca informazioni aggiornate sul web. Input: la query di ricerca.
+- web_search: cerca informazioni aggiornate sul web. USALO SEMPRE per: meteo/previsioni, notizie, prezzi/quotazioni, eventi recenti, orari di apertura, disponibilità, o qualunque informazione che cambia nel tempo e che non conosci con certezza dai tuoi dati di addestramento. Non rifiutare mai una richiesta di questo tipo dicendo che non hai accesso a dati in tempo reale: prova PRIMA con questo strumento. Input: la query di ricerca (es. "meteo Napoli oggi", "previsioni Milano domani").
 - get_current_datetime: restituisce data e ora attuali in UTC. Input: scrivi "-" (non serve altro). Se l'utente ha bisogno dell'ora nel suo fuso orario locale (non UTC) e non l'ha già indicato nella conversazione, NON calcolarla a caso: chiedigli prima in che città o fuso orario si trova, poi calcola tu la conversione da UTC una volta che te lo dice.
 - calculate: esegue un calcolo matematico VERO (es. "150 * 0.20", "34 + 12"). NON usarlo per domande di comprensione testuale che contengono solo numeri/importi/date come parte del testo (es. scegliere l'opzione corretta tra alternative, confrontare due frasi, verificare una trascrizione) — quelle si risolvono ragionando, non calcolando.
 - remember: salva un'informazione permanente sull'utente. Input: l'informazione da salvare.
@@ -79,6 +79,8 @@ THOUGHT: <ragionamento breve>
 FINAL_ANSWER: <risposta completa e ben scritta per l'utente, in italiano>
 
 REGOLA PIÙ IMPORTANTE: la maggior parte delle domande NON richiede nessuno strumento — domande di conoscenza generale, ragionamento, scelta multipla, confronto tra testi, opinioni, spiegazioni, scrittura creativa, ecc. vanno risolte SUBITO con FINAL_ANSWER al primo passo. Usa uno strumento SOLO se ti serve davvero un dato che non hai (es. informazioni aggiornate dal web, data/ora reale, un calcolo aritmetico vero, salvare un ricordo). Nel dubbio, preferisci rispondere direttamente piuttosto che usare uno strumento inutile.
+
+REGOLA COMPLEMENTARE: se invece la richiesta riguarda un'informazione in tempo reale che NON conosci con certezza (meteo, notizie, prezzi, eventi recenti, orari, disponibilità, ecc.), NON rifiutare subito dicendo che non hai accesso a dati in tempo reale — prova SEMPRE prima con web_search. Rifiutare senza aver provato lo strumento disponibile è un errore.
 
 Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione, anche se non perfetto. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
 ---`;
@@ -230,6 +232,29 @@ async function verifyPremiumToken(req) {
   }
 }
 
+// ── Validazione risposta ────────────────────────────────────────────
+// FIX 2026-08-24: openrouter/free (usato come riserva) sceglie un modello
+// gratuito A CASO tra quelli disponibili — a volte può selezionare un
+// modello di moderazione/classificazione contenuti (es. tipo Llama-Guard)
+// invece di un vero modello di chat. Questi modelli, se interrogati come
+// un normale completamento chat, rispondono con roba tipo "Safety: safe"
+// invece di una risposta vera — e l'utente vedeva quel testo assurdo al
+// posto di una risposta. Questo controllo riconosce questi casi e li
+// tratta come un fallimento del provider (si passa al successivo, o se
+// non ce ne sono altri, si mostra un errore pulito — mai testo assurdo).
+function looksLikeInvalidCompletion(text) {
+  if (!text || text.trim().length < 3) return true;
+  const t = text.trim();
+  // Deve corrispondere all'INTERA risposta (con eventuali codici categoria
+  // tipo "S1,S2" su una seconda riga, tipico di Llama-Guard), non solo
+  // all'inizio — altrimenti frasi normali come "Safe travels!" o "User
+  // feedback is..." scatterebbero come falsi positivi.
+  if (/^(safe|unsafe)(\s*\n\s*(s\d+,?\s*)+)?$/i.test(t)) return true;
+  if (/^safety\s*:\s*(safe|unsafe)\s*$/i.test(t)) return true;
+  if (/^user$/i.test(t)) return true;
+  return false;
+}
+
 // ── Chiamata non-streaming con fallback ───────────────────────────────
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
   for (let i = 0; i < providers.length; i++) {
@@ -258,6 +283,10 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
       }
       const data = await res.json();
       const text = data.choices?.[0]?.message?.content || '';
+      if (looksLikeInvalidCompletion(text)) {
+        console.log('[AI] ' + p.name + ' risposta non valida (probabile modello di moderazione, non di chat): "' + text.slice(0, 80) + '" — provo il prossimo provider');
+        continue;
+      }
       console.log('[AI] callWithFallback: used ' + p.name);
       return { text, provider: p.name };
     } catch(e) {
@@ -285,6 +314,21 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
+      // FIX 2026-08-24: stessa protezione di callWithFallback, applicata
+      // allo streaming — accumula i primi ~20 caratteri prima di inoltrarli
+      // al client, verifica che non siano l'inizio di una risposta "non di
+      // chat" (es. modello di moderazione selezionato a caso da
+      // openrouter/free), poi procede normalmente. Evita di mostrare
+      // testo assurdo tipo "Safety: safe" all'utente. Il rilevamento usa un
+      // flag (non un throw diretto) perché siamo dentro un try/catch di
+      // parsing JSON che altrimenti lo ingoierebbe silenziosamente — il
+      // throw vero avviene fuori da quel blocco, dove risale correttamente
+      // al codice che gestisce il passaggio al provider successivo.
+      let pendingText = '';
+      let validated = false;
+      let invalidDetected = false;
+      const CHECK_THRESHOLD = 20;
+      streamLoop:
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -296,10 +340,36 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
           try {
             const j = JSON.parse(t.slice(6));
             const tok = j.choices?.[0]?.delta?.content;
-            if (tok) onToken(tok);
-            if (j.choices?.[0]?.finish_reason) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done');
+            if (tok) {
+              if (!validated) {
+                pendingText += tok;
+                if (pendingText.length >= CHECK_THRESHOLD) {
+                  if (looksLikeInvalidCompletion(pendingText)) {
+                    invalidDetected = true;
+                  } else {
+                    validated = true;
+                    onToken(pendingText);
+                    pendingText = '';
+                  }
+                }
+              } else {
+                onToken(tok);
+              }
+            }
+            if (!invalidDetected && j.choices?.[0]?.finish_reason) {
+              if (!validated && pendingText) {
+                if (looksLikeInvalidCompletion(pendingText)) invalidDetected = true;
+                else { onToken(pendingText); pendingText = ''; }
+              }
+              if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done');
+            }
           } catch {}
+          if (invalidDetected) break streamLoop;
         }
+      }
+      if (invalidDetected) {
+        console.log('[AI] ' + p.name + ' streaming non valido (probabile modello di moderazione): "' + pendingText.slice(0, 80) + '" — provo il prossimo provider');
+        throw new Error(p.name + ': risposta non valida (modello di moderazione)');
       }
       return;
     } catch(e) {
