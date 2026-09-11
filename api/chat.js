@@ -47,6 +47,31 @@ const WEB_TRIGGERS = [
 // a singolo tool non servono più: ora è l'AI stessa a scegliere lo
 // strumento leggendo la descrizione nel prompt del loop ReAct (vedi sotto).
 
+// ── Disclaimer argomenti sensibili (medico/legale/finanziario) ─────────
+// Emerso da conversazioni reali: più utenti hanno chiesto consulti medici
+// diretti (crampi, emicrania, gastroenterite) senza nessun avviso che
+// ricordasse che l'AI non sostituisce un professionista. Rilevamento a
+// parole chiave (stesso stile di WEB_TRIGGERS), applicato a tutte le
+// modalità (chat normale, Multi-AI, Agente).
+const SENSITIVE_ADVICE_RE = [
+  /\b(sintomi|malattia|diagnosi|farmaco|medicina|dosaggio|posologia|terapia|curare|dottore|medico|patologia|febbre|antibiotico|effetti collaterali|mal di (testa|stomaco|schiena|pancia|gola)|gastroenterite|influenza|raffreddore|nausea|vomito|diarrea|crampi|infiammazione|allergia|consulto medico)\b/i,
+  /\b(avvocato|legale|contratto|denuncia|querela|tribunale|causa legale|licenzia\w*|divorzio|eredità|testamento|ricorso)\b/i,
+  /\b(investire|investimento|mutuo|prestito|fisco|tasse|dichiarazione dei redditi|pensione|previdenza|conviene comprare|conviene vendere)\b/i,
+];
+function needsSensitiveDisclaimer(text) {
+  return !!text && SENSITIVE_ADVICE_RE.some(re => re.test(text));
+}
+const SENSITIVE_DISCLAIMER_INSTRUCTION = '\n\n---\nNOTA: la richiesta dell\'utente potrebbe riguardare un ambito medico, legale o finanziario personale. Rispondi in modo utile e informativo come faresti normalmente, ma concludi la risposta con un breve richiamo naturale (una frase, non un disclaimer formale/invadente) che ricordi di consultare un professionista qualificato (medico/avvocato/consulente, a seconda del caso) per una valutazione vera, soprattutto per decisioni importanti o urgenti.\n---';
+// Applica l'istruzione al messaggio system di un array di messaggi (o lo crea se assente)
+function applySensitiveDisclaimer(messagesArr, userText) {
+  if (!needsSensitiveDisclaimer(userText)) return messagesArr;
+  const out = [...messagesArr];
+  const si = out.findIndex(m => m.role === 'system');
+  if (si !== -1) out[si] = { ...out[si], content: out[si].content + SENSITIVE_DISCLAIMER_INSTRUCTION };
+  else out.unshift({ role: 'system', content: SENSITIVE_DISCLAIMER_INSTRUCTION });
+  return out;
+}
+
 // ── LOOP ReAct: istruzioni, parsing, esecuzione strumenti ─────────────
 // Non usiamo il tool-calling nativo di Groq (in passato causava bug di
 // formato) — l'agente ragiona in testo strutturato che analizziamo noi:
@@ -245,13 +270,21 @@ async function verifyPremiumToken(req) {
 function looksLikeInvalidCompletion(text) {
   if (!text || text.trim().length < 3) return true;
   const t = text.trim();
-  // Deve corrispondere all'INTERA risposta (con eventuali codici categoria
-  // tipo "S1,S2" su una seconda riga, tipico di Llama-Guard), non solo
-  // all'inizio — altrimenti frasi normali come "Safe travels!" o "User
-  // feedback is..." scatterebbero come falsi positivi.
+  // FIX 2026-08-29: il primo tentativo cercava "safety: safe" solo se
+  // corrispondeva all'INTERA risposta — ma una variante reale vista in
+  // test ("User\nSafety: safe\nResponse\nSafety: safe", tipico di un
+  // classificatore che valuta sia il messaggio dell'utente sia la
+  // risposta) non veniva riconosciuta perché non è l'intera stringa.
+  // "safety: safe/unsafe" come frase non compare MAI in una vera
+  // risposta di chat in italiano o inglese — cercarla come sottostringa
+  // ovunque nel testo è sicuro, non richiede più che sia tutta la
+  // risposta.
+  if (/safety\s*:\s*(safe|unsafe)\b/i.test(t)) return true;
   if (/^(safe|unsafe)(\s*\n\s*(s\d+,?\s*)+)?$/i.test(t)) return true;
-  if (/^safety\s*:\s*(safe|unsafe)\s*$/i.test(t)) return true;
-  if (/^user$/i.test(t)) return true;
+  // Risposta composta solo da etichette di ruolo (User/Response/Assistant),
+  // senza contenuto vero — altro segnale tipico di un modello di
+  // classificazione invece che di chat.
+  if (/^\s*(user|response|assistant)\s*$/im.test(t) && t.replace(/[^a-zA-Z]/g, '').length < 60) return true;
   return false;
 }
 
@@ -278,8 +311,20 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
       if (!res.ok) {
+        // FIX 2026-08-29: prima si loggava il corpo JSON grezzo dell'errore
+        // dentro il messaggio — Vercel lo visualizza come testo con
+        // parentesi graffe che SEMBRA espandibile ma non lo è davvero,
+        // rendendo impossibile leggere il messaggio vero senza un piano
+        // a pagamento per i log storici. Ora si estrae il campo
+        // "message" leggibile, se presente, e si logga come testo pulito.
         const errBody = await res.text().catch(() => '');
-        throw new Error(p.name + ' error ' + res.status + (errBody ? ' — ' + errBody.slice(0, 200) : ''));
+        let readableMsg = errBody.slice(0, 200);
+        try {
+          const parsed = JSON.parse(errBody);
+          if (parsed?.error?.message) readableMsg = parsed.error.message;
+          else if (parsed?.message) readableMsg = parsed.message;
+        } catch {}
+        throw new Error(p.name + ' error ' + res.status + ': ' + readableMsg);
       }
       const data = await res.json();
       const text = data.choices?.[0]?.message?.content || '';
@@ -473,13 +518,14 @@ export default async function handler(req) {
   // BRANCH: MULTI-LLM (Fast o Best)
   // ══════════════════════════════════════════════════════════════════════
   if (multiMode) {
+    const disclaimedMessages = applySensitiveDisclaimer(messages, userText);
     const readable = makeSSE(async (send) => {
       send({ type: 'meta', webSearchUsed: false });
 
       if (multiMode === 'fast') {
         send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
         const race = MULTI_MODELS.map(m =>
-          callWithFallback([{ ...providers[0], model: m.id }], messages, maxTokens, temperature, m.id)
+          callWithFallback([{ ...providers[0], model: m.id }], disclaimedMessages, maxTokens, temperature, m.id)
             .then(r => r && r.text ? { model: m, text: r.text } : Promise.reject())
             .catch(() => null)
         );
@@ -497,7 +543,7 @@ export default async function handler(req) {
         send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
         const results = await Promise.allSettled(
           MULTI_MODELS.map(m =>
-            callWithFallback([{ ...providers[0], model: m.id }], messages, Math.min(maxTokens, 768), temperature, m.id)
+            callWithFallback([{ ...providers[0], model: m.id }], disclaimedMessages, Math.min(maxTokens, 768), temperature, m.id)
               .then(r => ({ model: m.name, text: r.text }))
           )
         );
@@ -518,9 +564,10 @@ export default async function handler(req) {
           '\n\nSintetizza la risposta migliore in italiano, completa e precisa, senza citare i modelli.';
 
         send({ type: 'multi_judging' });
+        const judgeSystemPrompt = 'Sintetizza risposte AI in italiano, preciso e completo.' + (needsSensitiveDisclaimer(userText) ? SENSITIVE_DISCLAIMER_INSTRUCTION : '');
         const judgeResult = await callWithFallback(
           [{ ...providers[0], model: JUDGE_MODEL }],
-          [{ role: 'system', content: 'Sintetizza risposte AI in italiano, preciso e completo.' }, { role: 'user', content: judgePrompt }],
+          [{ role: 'system', content: judgeSystemPrompt }, { role: 'user', content: judgePrompt }],
           maxTokens, 0.3, JUDGE_MODEL
         );
         const synthesis = judgeResult.text;
@@ -540,7 +587,8 @@ export default async function handler(req) {
     const readable = makeSSE(async (send) => {
       const sys = messages.find(m => m.role === 'system');
       const baseSystemPrompt = sys ? sys.content : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE in italiano.';
-      const reactSystemPrompt = buildReActSystemPrompt(baseSystemPrompt);
+      let reactSystemPrompt = buildReActSystemPrompt(baseSystemPrompt);
+      if (needsSensitiveDisclaimer(userText)) reactSystemPrompt += SENSITIVE_DISCLAIMER_INSTRUCTION;
 
       let reactMessages = [{ role: 'system', content: reactSystemPrompt }, ...messages.filter(m => m.role !== 'system')];
       let usedWeb = false;
@@ -671,6 +719,7 @@ export default async function handler(req) {
     if (si !== -1) finalMsgs[si] = { ...finalMsgs[si], content: finalMsgs[si].content + webCtx };
     else finalMsgs.unshift({ role: 'system', content: webCtx });
   }
+  finalMsgs = applySensitiveDisclaimer(finalMsgs, userText);
 
   try {
     const readable = makeSSE(async (send) => {
