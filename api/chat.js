@@ -15,23 +15,78 @@ import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js'
 // può variare leggermente di modello in modello — accettabile perché
 // OpenRouter qui è solo la riserva, non il provider principale.
 const PROVIDER_CHAIN = [
-  { name: 'Groq',       url: 'https://api.groq.com/openai/v1/chat/completions',       model: 'llama-3.3-70b-versatile',                    keyEnv: 'GROQ_API_KEY' },
+  { name: 'Groq',       url: 'https://api.groq.com/openai/v1/chat/completions',       model: 'openai/gpt-oss-120b',                        keyEnv: 'GROQ_API_KEY' },
   { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',          model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
 
-// NOTA 2026-08-23: gemma2-9b-it (deprecato ott. 2025) e mixtral-8x7b-32768
-// (deprecato mar. 2025) erano usati qui ma non più disponibili su Groq da
-// mesi — la modalità Multi-AI girava di fatto con un solo modello su 3,
-// in modo silenzioso (Promise.allSettled scarta i falliti senza errore
-// visibile). Sostituiti con GPT-OSS 120B/20B, modelli attualmente attivi
-// (verificato su console.groq.com/docs/models), diversi da Llama per una
-// vera diversità di "opinioni" nel confronto Best-of-N.
+// AGGIORNAMENTO CRITICO 2026-09-11: llama-3.3-70b-versatile e
+// llama-3.1-8b-instant sono stati dismessi da Groq il 16 agosto 2026
+// (confermato su console.groq.com/docs/deprecations). Erano usati come
+// modello principale e modello giudice — questo significa che per oltre
+// 3 settimane OGNI messaggio falliva su Groq e passava SEMPRE dal
+// fallback OpenRouter (con selezione casuale del modello), spiegando i
+// bug intermittenti di qualità/formato visti nei test (token grezzi
+// "<|toolcall|>", testo in cinese mescolato, disclaimer medico ignorato).
+// Sostituiti con i modelli attualmente attivi (verificato su
+// console.groq.com/docs/models e /docs/vision, fonte ufficiale, appena
+// consultata): openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b
+// (quest'ultimo multimodale, copre anche il caso Vision sotto).
 const MULTI_MODELS = [
-  { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3'   },
+  { id: 'qwen/qwen3.6-27b',       name: 'Qwen 3.6 27B' },
   { id: 'openai/gpt-oss-120b',     name: 'GPT-OSS 120B' },
   { id: 'openai/gpt-oss-20b',      name: 'GPT-OSS 20B'  },
 ];
-const JUDGE_MODEL = 'llama-3.1-8b-instant';
+const JUDGE_MODEL = 'openai/gpt-oss-20b';
+
+// ══════════════════════════════════════════════════════════════════════
+// AUTO-RIPARAZIONE MODELLI (aggiunto 2026-09-11)
+// ══════════════════════════════════════════════════════════════════════
+// Perché esiste: a fine agosto 2026 Groq ha dismesso i modelli che
+// AInstAIn usava, e il problema è rimasto invisibile per quasi un mese —
+// ogni richiesta falliva su Groq e passava silenziosamente al fallback
+// OpenRouter (con selezione casuale del modello), causando bug strani e
+// difficili da diagnosticare (risposte di modelli di moderazione, token
+// grezzi, istruzioni di sistema ignorate).
+//
+// Cosa fa: se un modello configurato risulta inesistente (404 "model not
+// found"), il sistema se ne accorge, lo marca come non disponibile per
+// il resto della sessione, e passa AUTOMATICAMENTE al prossimo modello
+// alternativo funzionante su Groq — invece di degradare sul fallback
+// casuale. Nota di progetto: NON scarica né adotta automaticamente
+// modelli nuovi non testati (un modello più recente non è
+// necessariamente migliore per questo caso d'uso: potrebbe rispondere in
+// inglese, ignorare il formato ReAct, ecc.). Per scoprire i modelli
+// nuovi c'è l'endpoint di diagnostica /api/models-health, da consultare
+// manualmente e decidere con cognizione.
+
+// Modelli di riserva su Groq, in ordine di preferenza. Se quello
+// configurato sparisce, si prova il primo di questi che funziona.
+const GROQ_FALLBACK_MODELS = [
+  'openai/gpt-oss-120b',
+  'openai/gpt-oss-20b',
+  'qwen/qwen3.6-27b',
+];
+
+// Memoria (per istanza) dei modelli risultati inesistenti: evita di
+// riprovarli a ogni richiesta finché l'istanza resta attiva.
+const deadModels = new Set();
+
+function isModelNotFoundError(status, message) {
+  if (status !== 404) return false;
+  return /does not exist|model_not_found|not found|no access/i.test(message || '');
+}
+
+// Restituisce il modello da usare davvero: se quello richiesto è noto
+// come inesistente, ne propone uno alternativo ancora valido.
+function resolveUsableModel(requestedModel) {
+  if (!deadModels.has(requestedModel)) return requestedModel;
+  const alternative = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+  if (alternative) {
+    console.log('[AI] auto-riparazione: "' + requestedModel + '" non disponibile, uso "' + alternative + '"');
+    return alternative;
+  }
+  return requestedModel; // nessuna alternativa nota: riprova comunque
+}
 
 const WEB_TRIGGERS = [
   /\b(oggi|adesso|ora|attuale|attualmente|recente|recentemente|ultimo|ultima|ultimi|ultime|notizie|news|ha vinto|hanno vinto|chi ha|chi è|dov'è)\b/i,
@@ -285,6 +340,14 @@ function looksLikeInvalidCompletion(text) {
   // senza contenuto vero — altro segnale tipico di un modello di
   // classificazione invece che di chat.
   if (/^\s*(user|response|assistant)\s*$/im.test(t) && t.replace(/[^a-zA-Z]/g, '').length < 60) return true;
+  // FIX 2026-09-11: visto un caso reale con token grezzi di tool-calling
+  // nativo che trapelavano nella risposta invece di essere interpretati
+  // ("<|toolcall|start|>[getcurrentdatetime()]<|toolcall|end|>") — segno
+  // di un modello selezionato a caso da OpenRouter che usa un proprio
+  // formato di function-calling nativo invece di seguire le istruzioni
+  // ReAct testuali. Questi marcatori non compaiono mai in una vera
+  // risposta di chat.
+  if (/<\|(tool_?call|im_start|im_end|end_of_turn)/i.test(t)) return true;
   return false;
 }
 
@@ -302,7 +365,8 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
     // Ora l'override personalizzato (es. da selectBestModel) si applica
     // SOLO al provider principale (il primo, Groq); i provider di
     // riserva usano sempre il proprio nome modello corretto.
-    const useModel = i === 0 ? (model || p.model) : p.model;
+    const requestedModel = i === 0 ? (model || p.model) : p.model;
+    const useModel = i === 0 ? resolveUsableModel(requestedModel) : requestedModel;
     try {
       const res = await fetch(p.url, {
         method: 'POST',
@@ -324,6 +388,31 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
           if (parsed?.error?.message) readableMsg = parsed.error.message;
           else if (parsed?.message) readableMsg = parsed.message;
         } catch {}
+
+        // AUTO-RIPARAZIONE: il modello non esiste più (dismesso dal
+        // provider). Marcalo e ritenta SUBITO con un'alternativa valida,
+        // invece di degradare silenziosamente sul fallback casuale.
+        if (i === 0 && isModelNotFoundError(res.status, readableMsg)) {
+          console.log('[AI] ⚠️ MODELLO NON DISPONIBILE: "' + useModel + '" — ' + readableMsg);
+          deadModels.add(useModel);
+          const retryModel = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+          if (retryModel) {
+            console.log('[AI] auto-riparazione: ritento con "' + retryModel + '"');
+            const retryRes = await fetch(p.url, {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
+              body: JSON.stringify({ model: retryModel, messages, max_tokens: maxTokens, temperature, stream: false }),
+            });
+            if (retryRes.ok) {
+              const retryData = await retryRes.json();
+              const retryText = retryData.choices?.[0]?.message?.content || '';
+              if (!looksLikeInvalidCompletion(retryText)) {
+                console.log('[AI] auto-riparazione riuscita con "' + retryModel + '"');
+                return { text: retryText, provider: p.name };
+              }
+            }
+          }
+        }
         throw new Error(p.name + ' error ' + res.status + ': ' + readableMsg);
       }
       const data = await res.json();
@@ -346,16 +435,48 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
-    const useModel = i === 0 ? (model || p.model) : p.model; // stesso fix di callWithFallback
+    const requestedModel = i === 0 ? (model || p.model) : p.model;
+    let useModel = i === 0 ? resolveUsableModel(requestedModel) : requestedModel;
     try {
-      const res = await fetch(p.url, {
+      let res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
         body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: true }),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
-      if (!res.ok) { const e = await res.text(); if (res.status === 429) continue; throw new Error(p.name + ': ' + e); }
-      console.log('[AI] streamWithFallback: using ' + p.name);
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        let readableMsg = errBody.slice(0, 200);
+        try {
+          const parsed = JSON.parse(errBody);
+          if (parsed?.error?.message) readableMsg = parsed.error.message;
+          else if (parsed?.message) readableMsg = parsed.message;
+        } catch {}
+
+        // AUTO-RIPARAZIONE (stessa logica di callWithFallback)
+        let recovered = false;
+        if (i === 0 && isModelNotFoundError(res.status, readableMsg)) {
+          console.log('[AI] ⚠️ MODELLO NON DISPONIBILE (stream): "' + useModel + '" — ' + readableMsg);
+          deadModels.add(useModel);
+          const retryModel = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+          if (retryModel) {
+            console.log('[AI] auto-riparazione (stream): ritento con "' + retryModel + '"');
+            const retryRes = await fetch(p.url, {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
+              body: JSON.stringify({ model: retryModel, messages, max_tokens: maxTokens, temperature, stream: true }),
+            });
+            if (retryRes.ok) {
+              res = retryRes;
+              useModel = retryModel;
+              recovered = true;
+              console.log('[AI] auto-riparazione riuscita (stream) con "' + retryModel + '"');
+            }
+          }
+        }
+        if (!recovered) throw new Error(p.name + ' error ' + res.status + ': ' + readableMsg);
+      }
+      console.log('[AI] streamWithFallback: using ' + p.name + ' (' + useModel + ')');
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
@@ -474,7 +595,7 @@ export default async function handler(req) {
   catch(e) { return new Response(JSON.stringify({ error: 'Invalid body' }), { status: 400, headers: { ...cors, 'Content-Type': 'application/json' } }); }
 
   const messages    = body.messages || [];
-  const model       = body.model || 'llama-3.3-70b-versatile';
+  const model       = body.model || 'openai/gpt-oss-120b';
   // ── NUOVO: forceWeb e multiMode sono feature Premium. Anche se il client
   // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
   const forceWeb    = isPremiumServer && body.webSearch === true;
