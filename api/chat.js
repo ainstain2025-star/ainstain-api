@@ -196,8 +196,15 @@ async function executeReActTool(name, input, ctx) {
       return 'Informazione salvata: "' + (input || '') + '"';
     case 'web_search': {
       if (!ctx.tavilyKey) return 'Ricerca web non disponibile in questo momento.';
-      try { return await tavilySearch((input || '').slice(0, 150), ctx.tavilyKey); }
-      catch (e) { return 'Ricerca fallita: ' + e.message; }
+      try {
+        const result = await tavilySearch((input || '').slice(0, 150), ctx.tavilyKey);
+        // FIX 2026-09-19: i risultati Tavily (fino a 5, con snippet lunghi)
+        // venivano inseriti per intero nella conversazione, senza taglio —
+        // confermato dai log Vercel come concausa del superamento del
+        // tetto Groq di 8000 token/minuto (errore 413). Tagliato a 1200
+        // caratteri (~300 token): riduce il peso senza svuotare il senso.
+        return result.length > 1200 ? result.slice(0, 1200) + '…' : result;
+      } catch (e) { return 'Ricerca fallita: ' + e.message; }
     }
     default:
       return 'Strumento "' + name + '" non riconosciuto.';
@@ -408,7 +415,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
               const retryText = retryData.choices?.[0]?.message?.content || '';
               if (!looksLikeInvalidCompletion(retryText)) {
                 console.log('[AI] auto-riparazione riuscita con "' + retryModel + '"');
-                return { text: retryText, provider: p.name };
+                return { text: retryText, provider: p.name, model: retryModel };
               }
             }
           }
@@ -419,10 +426,35 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
       const text = data.choices?.[0]?.message?.content || '';
       if (looksLikeInvalidCompletion(text)) {
         console.log('[AI] ' + p.name + ' risposta non valida (probabile modello di moderazione, non di chat): "' + text.slice(0, 80) + '" — provo il prossimo provider');
+        // FIX 2026-09-19: trovato nei log — quando questo è l'ULTIMO
+        // provider della catena (OpenRouter), "provo il prossimo" non
+        // esisteva: il ciclo finiva e tutto falliva per un singolo colpo
+        // sfortunato del selettore casuale di OpenRouter (che a volte
+        // pesca un modello di moderazione invece di uno di chat vero).
+        // Un secondo tentativo sullo STESSO provider ha buone probabilità
+        // di pescare un modello diverso, valido.
+        if (i === providers.length - 1) {
+          console.log('[AI] ' + p.name + ' ultimo provider: ritento una volta prima di arrendermi...');
+          try {
+            const retryRes2 = await fetch(p.url, {
+              method: 'POST',
+              headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
+              body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: false }),
+            });
+            if (retryRes2.ok) {
+              const retryData2 = await retryRes2.json();
+              const retryText2 = retryData2.choices?.[0]?.message?.content || '';
+              if (!looksLikeInvalidCompletion(retryText2)) {
+                console.log('[AI] ' + p.name + ' secondo tentativo riuscito');
+                return { text: retryText2, provider: p.name, model: useModel };
+              }
+            }
+          } catch {}
+        }
         continue;
       }
       console.log('[AI] callWithFallback: used ' + p.name);
-      return { text, provider: p.name };
+      return { text, provider: p.name, model: useModel };
     } catch(e) {
       if (e.message.includes('429')) { continue; }
       console.log('[AI] ' + p.name + ' error: ' + e.message);
@@ -527,7 +559,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
                 if (looksLikeInvalidCompletion(pendingText)) invalidDetected = true;
                 else { onToken(pendingText); pendingText = ''; }
               }
-              if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done');
+              if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done', { model: useModel, provider: p.name });
             }
           } catch {}
           if (invalidDetected) break streamLoop;
@@ -753,6 +785,7 @@ export default async function handler(req) {
       let usedWeb = false;
       let finalAnswer = null;
       let lastActionSignature = null;
+      let lastModelUsed = null, lastProviderUsed = null;
 
       // FIX 2026-09-19: bug reale trovato in test utente — per domande su
       // notizie/prezzi/eventi recenti l'Agente a volte rispondeva SENZA MAI
@@ -785,9 +818,26 @@ export default async function handler(req) {
         try {
           const r = await callWithFallback(providers, reactMessages, 700, 0.3, model);
           stepText = r.text;
+          lastModelUsed = r.model; lastProviderUsed = r.provider;
         } catch (e) {
-          send({ type: 'error', message: e.message });
-          return;
+          // FIX 2026-09-19: trovato nei log — Groq e OpenRouter possono
+          // fallire ENTRAMBI nello stesso istante (Groq per il tetto TPM,
+          // OpenRouter per il selettore casuale che pesca un modello
+          // sbagliato). Prima, questo mandava subito un errore
+          // all'utente, che il frontend mostrava come "Errore del
+          // server (500)" — fuorviante, perché non è un crash: è un
+          // sovraccarico temporaneo dei due provider gratuiti insieme.
+          // Un secondo tentativo dell'intero passo, spesso a distanza di
+          // pochi secondi, trova provider liberi e risolve da solo.
+          console.log('[AI] Agente: passo fallito su entrambi i provider (' + e.message + '), ritento una volta...');
+          try {
+            const r2 = await callWithFallback(providers, reactMessages, 700, 0.3, model);
+            stepText = r2.text;
+            lastModelUsed = r2.model; lastProviderUsed = r2.provider;
+          } catch (e2) {
+            send({ type: 'error', message: '⏳ I server AI gratuiti (Groq/OpenRouter) sono momentaneamente sovraccarichi — ho già ritentato automaticamente senza successo. Riprova tra qualche secondo.', overloaded: true });
+            return;
+          }
         }
 
         const parsed = parseReActStep(stepText);
@@ -851,13 +901,14 @@ export default async function handler(req) {
           ];
           const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, model);
           finalAnswer = synthResult.text;
+          lastModelUsed = synthResult.model; lastProviderUsed = synthResult.provider;
         } catch (e) {
           finalAnswer = '⚠️ Ho ragionato a lungo su questa richiesta senza arrivare a una conclusione netta. Prova a riformulare la richiesta in modo più specifico, o disattiva la modalità Agente per una risposta diretta.';
         }
       }
 
       checkDateConsistency(finalAnswer, WEB_TRIGGERS.some(re => re.test(userText)));
-      send({ type: 'meta', webSearchUsed: usedWeb });
+      send({ type: 'meta', webSearchUsed: usedWeb, model: lastModelUsed, provider: lastProviderUsed });
       for (let i = 0; i < finalAnswer.length; i += 4) send({ type: 'token', token: finalAnswer.slice(i, i + 4) });
       send({ type: 'done' });
     });
@@ -910,7 +961,11 @@ export default async function handler(req) {
       send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
       await streamWithFallback(providers, finalMsgs, maxTokens, temperature, smartModel,
         tok => send({ type: 'token', token: tok }),
-        reason => send({ type: reason || 'done' })
+        // FIX 2026-09-19: propaga quale modello/provider ha risposto
+        // davvero (utile per il tag discreto "che modello ha risposto"
+        // in UI, e per capire al volo se è scattato l'auto-riparazione
+        // o il fallback su OpenRouter, senza dover aprire i log Vercel).
+        (reason, info) => send({ type: reason || 'done', model: info?.model, provider: info?.provider })
       );
     });
     return new Response(readable, { status: 200, headers: sseH });
