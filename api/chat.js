@@ -97,6 +97,14 @@ const WEB_TRIGGERS = [
   /\b(classifica|ranking|risultati|vincitore|campione|partita|gol)\b/i,
   /\b(borsa|azioni|bitcoin|crypto|euro|dollaro)\b/i,
   /\b(elezioni|governo|presidente|premier|ministro)\b/i,
+  // FIX 2026-09-19: trovato nel test 6 — "cerca il prezzo di un iPhone 16"
+  // non faceva scattare nessuna regola esistente ("quanto costa" richiede
+  // quella frase esatta, "costerebbe"/"prezzo"/"sconto" non erano coperti),
+  // quindi l'Agente restava libero di NON cercare affatto, invece di
+  // provarci. Aggiunte parole legate a prezzi/acquisti, e l'imperativo
+  // "cerca" come richiesta esplicita di ricerca a prescindere dal resto.
+  /\b(prezzo|prezzi|costa|costano|costerebbe|sconto|scontato|offerta|offerte)\b/i,
+  /\bcerca\b/i,
 ];
 // Le regex CALC_RE/IMAGE_RE/DATETIME_RE/REMEMBER_RE del vecchio dispatcher
 // a singolo tool non servono più: ora è l'AI stessa a scegliere lo
@@ -156,13 +164,13 @@ ACTION_INPUT: <input per lo strumento>
 
 Per dare la risposta finale (quando hai già tutte le informazioni necessarie):
 THOUGHT: <ragionamento breve>
-FINAL_ANSWER: <risposta completa e ben scritta per l'utente, in italiano>
+FINAL_ANSWER: <risposta completa e ben scritta per l'utente, SEMPRE in italiano — anche se stai dicendo di non aver trovato un'informazione: mai in inglese>
 
 REGOLA PIÙ IMPORTANTE: la maggior parte delle domande NON richiede nessuno strumento — domande di conoscenza generale, ragionamento, scelta multipla, confronto tra testi, opinioni, spiegazioni, scrittura creativa, ecc. vanno risolte SUBITO con FINAL_ANSWER al primo passo. Usa uno strumento SOLO se ti serve davvero un dato che non hai (es. informazioni aggiornate dal web, data/ora reale, un calcolo aritmetico vero, salvare un ricordo). Nel dubbio, preferisci rispondere direttamente piuttosto che usare uno strumento inutile.
 
 REGOLA COMPLEMENTARE: se invece la richiesta riguarda un'informazione in tempo reale che NON conosci con certezza (meteo, notizie, prezzi, eventi recenti, orari, disponibilità, ecc.), NON rifiutare subito dicendo che non hai accesso a dati in tempo reale — prova SEMPRE prima con web_search. Rifiutare senza aver provato lo strumento disponibile è un errore.
 
-Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione. IMPORTANTE — questo "ragionamento migliore" vale per valutazioni, opinioni e ragionamento, MAI per fatti concreti come date, prezzi, notizie o risultati: se non hai un'Observation reale che li conferma, DEVI dire chiaramente all'utente che non sei riuscito a recuperare l'informazione aggiornata, invece di inventare una data, un prezzo o una notizia plausibile. Una risposta onesta su un dato mancante è sempre meglio di un dato inventato. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
+Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione. IMPORTANTE — questo "ragionamento migliore" vale per valutazioni, opinioni e ragionamento, MAI per fatti concreti come date, prezzi, notizie o risultati: se non hai un'Observation reale che li conferma, DEVI dire chiaramente all'utente che non sei riuscito a recuperare l'informazione aggiornata, invece di inventare una data, un prezzo o una notizia plausibile. Una risposta onesta su un dato mancante è sempre meglio di un dato inventato — ma va scritta SEMPRE in italiano, mai in inglese, anche quando ammetti di non aver trovato l'informazione. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
 ---`;
 }
 
@@ -896,7 +904,7 @@ export default async function handler(req) {
             role: 'user',
             content: 'OBSERVATION: ' + observation + '\n\n' + (
               isRepeat
-                ? '(Hai già provato questa stessa azione con lo stesso input: non aiuta a procedere. NON ripeterla di nuovo — rispondi ORA con FINAL_ANSWER usando il tuo miglior giudizio. Se la domanda richiede un fatto concreto — data, prezzo, notizia, risultato — che le Observation non ti hanno dato, dillo chiaramente invece di inventarlo.)'
+                ? '(Hai già provato questa stessa azione con lo stesso input: non aiuta a procedere. NON ripeterla di nuovo — rispondi ORA con FINAL_ANSWER, SEMPRE in italiano, usando il tuo miglior giudizio. Se la domanda richiede un fatto concreto — data, prezzo, notizia, risultato — che le Observation non ti hanno dato, dillo chiaramente in italiano invece di inventarlo o di rispondere in inglese.)'
                 : '(Continua il ragionamento. Se hai già abbastanza informazioni, rispondi con FINAL_ANSWER.)'
             )
           });
@@ -916,7 +924,7 @@ export default async function handler(req) {
         // risposta diretta è sempre meglio di nessuna risposta).
         try {
           const synthesisMessages = [
-            { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, in italiano, usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat. IMPORTANTE: se la domanda richiede un fatto concreto (data, prezzo, notizia, risultato) che non hai davvero recuperato in nessuna Observation qui sopra, dillo chiaramente invece di inventarlo — meglio ammettere di non aver trovato l\'informazione che darne una falsa.' },
+            { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, SEMPRE E SOLO in italiano (mai in inglese, qualunque sia la lingua che hai usato nel ragionamento interno), usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat. IMPORTANTE: se la domanda richiede un fatto concreto (data, prezzo, notizia, risultato) che non hai davvero recuperato in nessuna Observation qui sopra, dillo chiaramente in italiano invece di inventarlo — meglio ammettere di non aver trovato l\'informazione che darne una falsa.' },
             ...reactMessages.filter(m => m.role !== 'system')
           ];
           const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, model);
