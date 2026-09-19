@@ -162,7 +162,7 @@ REGOLA PIÙ IMPORTANTE: la maggior parte delle domande NON richiede nessuno stru
 
 REGOLA COMPLEMENTARE: se invece la richiesta riguarda un'informazione in tempo reale che NON conosci con certezza (meteo, notizie, prezzi, eventi recenti, orari, disponibilità, ecc.), NON rifiutare subito dicendo che non hai accesso a dati in tempo reale — prova SEMPRE prima con web_search. Rifiutare senza aver provato lo strumento disponibile è un errore.
 
-Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione, anche se non perfetto. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
+Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima di continuare — non inventare mai risultati. Se hai già usato uno strumento e il risultato non ti aiuta a procedere, NON ripetere la stessa azione: passa a FINAL_ANSWER con il ragionamento migliore che hai a disposizione. IMPORTANTE — questo "ragionamento migliore" vale per valutazioni, opinioni e ragionamento, MAI per fatti concreti come date, prezzi, notizie o risultati: se non hai un'Observation reale che li conferma, DEVI dire chiaramente all'utente che non sei riuscito a recuperare l'informazione aggiornata, invece di inventare una data, un prezzo o una notizia plausibile. Una risposta onesta su un dato mancante è sempre meglio di un dato inventato. Hai al massimo ${MAX_REACT_STEPS} passi totali — arrivare a un buon FINAL_ANSWER entro il limite è sempre meglio che restare bloccato.
 ---`;
 }
 
@@ -613,6 +613,44 @@ export default async function handler(req) {
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
+  // ── FIX 2026-09-19: data reale sempre nota al modello, in TUTTE le
+  // modalità ─────────────────────────────────────────────────────────
+  // Prima, il modello conosceva la data vera solo se decideva lui stesso
+  // di invocare lo strumento get_current_datetime (solo in modalità
+  // Agente) — un test reale ha mostrato che spesso NON lo fa, e risponde
+  // inventando una data plausibile ma sbagliata (es. "27 settembre"
+  // quando in realtà era il 19). Iniettando qui la data reale nel
+  // messaggio di sistema, per ogni richiesta, il modello non deve più
+  // indovinarla in nessuna modalità (chat normale, Multi-AI, Agente).
+  const realDateNote = 'Nota di sistema: oggi è ' +
+    new Date().toLocaleString('it-IT', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) +
+    ' (data reale in UTC). Usala se ti serve sapere che giorno è oggi o per valutare cosa è "recente" — non indovinarla mai.';
+  {
+    const dateIdx = messages.findIndex(m => m.role === 'system');
+    if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNote };
+    else messages.unshift({ role: 'system', content: realDateNote });
+  }
+
+  // ── FIX 2026-09-19: log di allerta se la risposta finale cita una data
+  // (giorno+mese+anno) diversa da quella odierna, per richieste su
+  // informazioni in tempo reale — non corregge il testo (rischio di falsi
+  // positivi su date citate legittimamente, es. dentro una notizia), ma
+  // lascia una traccia nei log Vercel per il controllo qualità.
+  const ITALIAN_MONTHS = ['gennaio','febbraio','marzo','aprile','maggio','giugno','luglio','agosto','settembre','ottobre','novembre','dicembre'];
+  function checkDateConsistency(answerText, isTimeSensitive) {
+    if (!isTimeSensitive || !answerText) return;
+    const today = new Date();
+    const todayDay = today.getUTCDate(), todayMonth = ITALIAN_MONTHS[today.getUTCMonth()], todayYear = today.getUTCFullYear();
+    const re = new RegExp('\\b(\\d{1,2})\\s+(' + ITALIAN_MONTHS.join('|') + ')\\s+(\\d{4})\\b', 'gi');
+    let m;
+    while ((m = re.exec(answerText)) !== null) {
+      const [, d, mon, y] = m;
+      if (mon.toLowerCase() !== todayMonth || parseInt(y, 10) !== todayYear || parseInt(d, 10) !== todayDay) {
+        console.log('[AI] ⚠️ POSSIBILE DATA INCOERENTE nella risposta: "' + d + ' ' + mon + ' ' + y + '" (oggi è ' + todayDay + ' ' + todayMonth + ' ' + todayYear + ') — verificare se allucinazione.');
+      }
+    }
+  }
+
   console.log('[AI] premium=' + isPremiumServer + ' agentMode=' + agentMode + ' multiMode=' + multiMode + ' smartModel=' + smartModel);
 
   // ══════════════════════════════════════════════════════════════════════
@@ -716,6 +754,30 @@ export default async function handler(req) {
       let finalAnswer = null;
       let lastActionSignature = null;
 
+      // FIX 2026-09-19: bug reale trovato in test utente — per domande su
+      // notizie/prezzi/eventi recenti l'Agente a volte rispondeva SENZA MAI
+      // invocare web_search (confermato dai log Vercel: una sola chiamata
+      // al modello, "External APIs: no outgoing requests"), inventando con
+      // sicurezza contenuto plausibile ma falso (notizie, data sbagliata,
+      // prezzo Bitcoin inventato) invece di ammettere di non sapere.
+      // La sola istruzione testuale nel prompt ("usa web_search per notizie
+      // ecc.") non basta: il modello può ignorarla. Stesso meccanismo
+      // deterministico già usato con successo in chat normale (WEB_TRIGGERS,
+      // vedi 'shouldSearch' più sotto) — qui forziamo il primo passo invece
+      // di lasciare la decisione al giudizio del modello.
+      if (tavilyKey && WEB_TRIGGERS.some(re => re.test(userText))) {
+        send({ type: 'agent_thought', thought: 'Domanda su informazioni in tempo reale: eseguo prima una ricerca web.', step: 1 });
+        send({ type: 'agent_tools', tools: ['web_search'] });
+        usedWeb = true;
+        const forcedObservation = await executeReActTool('web_search', userText, { tavilyKey });
+        send({ type: 'agent_observation', tool: 'web_search', observation: String(forcedObservation).slice(0, 300) });
+        reactMessages.push({ role: 'assistant', content: 'THOUGHT: La domanda riguarda informazioni in tempo reale, cerco prima sul web.\nACTION: web_search\nACTION_INPUT: ' + userText });
+        reactMessages.push({
+          role: 'user',
+          content: 'OBSERVATION: ' + forcedObservation + '\n\n(Hai già qui sopra i risultati della ricerca web. Usali per rispondere con FINAL_ANSWER. Se non contengono l\'informazione richiesta — o la ricerca non ha dato risultati utili — dillo chiaramente all\'utente invece di inventare date, prezzi o notizie.)'
+        });
+      }
+
       for (let step = 1; step <= MAX_REACT_STEPS; step++) {
         send({ type: 'agent_step', step, max: MAX_REACT_STEPS });
 
@@ -764,7 +826,7 @@ export default async function handler(req) {
             role: 'user',
             content: 'OBSERVATION: ' + observation + '\n\n' + (
               isRepeat
-                ? '(Hai già provato questa stessa azione con lo stesso input: non aiuta a procedere. NON ripeterla di nuovo — rispondi ORA con FINAL_ANSWER usando il tuo miglior giudizio con le informazioni che hai.)'
+                ? '(Hai già provato questa stessa azione con lo stesso input: non aiuta a procedere. NON ripeterla di nuovo — rispondi ORA con FINAL_ANSWER usando il tuo miglior giudizio. Se la domanda richiede un fatto concreto — data, prezzo, notizia, risultato — che le Observation non ti hanno dato, dillo chiaramente invece di inventarlo.)'
                 : '(Continua il ragionamento. Se hai già abbastanza informazioni, rispondi con FINAL_ANSWER.)'
             )
           });
@@ -784,7 +846,7 @@ export default async function handler(req) {
         // risposta diretta è sempre meglio di nessuna risposta).
         try {
           const synthesisMessages = [
-            { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, in italiano, usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat.' },
+            { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, in italiano, usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat. IMPORTANTE: se la domanda richiede un fatto concreto (data, prezzo, notizia, risultato) che non hai davvero recuperato in nessuna Observation qui sopra, dillo chiaramente invece di inventarlo — meglio ammettere di non aver trovato l\'informazione che darne una falsa.' },
             ...reactMessages.filter(m => m.role !== 'system')
           ];
           const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, model);
@@ -794,6 +856,7 @@ export default async function handler(req) {
         }
       }
 
+      checkDateConsistency(finalAnswer, WEB_TRIGGERS.some(re => re.test(userText)));
       send({ type: 'meta', webSearchUsed: usedWeb });
       for (let i = 0; i < finalAnswer.length; i += 4) send({ type: 'token', token: finalAnswer.slice(i, i + 4) });
       send({ type: 'done' });
