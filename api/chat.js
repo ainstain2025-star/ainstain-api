@@ -355,6 +355,21 @@ function looksLikeInvalidCompletion(text) {
   // ReAct testuali. Questi marcatori non compaiono mai in una vera
   // risposta di chat.
   if (/<\|(tool_?call|im_start|im_end|end_of_turn)/i.test(t)) return true;
+  // FIX 2026-09-19: trovato nei test un'altra variante di token grezzi
+  // leakati ("<dots functioncall>" ripetuto 3 volte) — formato diverso
+  // dal precedente (niente "<|...|>" con le pipe), stesso fenomeno di
+  // fondo: un modello selezionato a caso da OpenRouter che tenta il
+  // proprio function-calling nativo invece di seguire il formato ReAct
+  // testuale. Pattern più generico: qualunque tag con "function"+"call"
+  // dentro le parentesi angolari, qualunque sia il resto del formato.
+  if (/<[^>]{0,40}\bfunction[\s_-]*call\b[^>]{0,40}>/i.test(t)) return true;
+  // Difesa generica aggiuntiva: risposta che è la STESSA riga corta
+  // ripetuta 2+ volte con caratteri tipici di marcatori/token grezzi
+  // (< > | _) — nessuna vera risposta di chat ha questa forma, è il
+  // segno di un modello che va in loop su un singolo tag invece di
+  // scrivere una risposta.
+  const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length >= 2 && new Set(lines).size === 1 && lines[0].length < 60 && /[<>|_]/.test(lines[0])) return true;
   return false;
 }
 
@@ -645,18 +660,23 @@ export default async function handler(req) {
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
-  // ── FIX 2026-09-19: data reale sempre nota al modello, in TUTTE le
-  // modalità ─────────────────────────────────────────────────────────
-  // Prima, il modello conosceva la data vera solo se decideva lui stesso
-  // di invocare lo strumento get_current_datetime (solo in modalità
-  // Agente) — un test reale ha mostrato che spesso NON lo fa, e risponde
-  // inventando una data plausibile ma sbagliata (es. "27 settembre"
-  // quando in realtà era il 19). Iniettando qui la data reale nel
-  // messaggio di sistema, per ogni richiesta, il modello non deve più
-  // indovinarla in nessuna modalità (chat normale, Multi-AI, Agente).
-  const realDateNote = 'Nota di sistema: oggi è ' +
+  // ── FIX 2026-09-19: data E ORA reali sempre note al modello, in TUTTE
+  // le modalità ─────────────────────────────────────────────────────────
+  // Prima, il modello conosceva la data/ora vera solo se decideva lui
+  // stesso di invocare lo strumento get_current_datetime (solo in
+  // modalità Agente) — due test reali hanno mostrato che spesso NON lo
+  // fa: una volta ha inventato una data sbagliata ("27 settembre" invece
+  // del 19), un'altra un orario sbagliato ("12:20" quando in realtà
+  // erano le 19:02, con l'utente che aveva appena detto di trovarsi a
+  // Napoli). Prima il fix copriva solo la data — ora include anche
+  // l'ora esatta, così il modello ha SEMPRE il riferimento reale per
+  // calcolare l'ora locale di qualunque città, senza indovinare né
+  // dover decidere di chiamare uno strumento.
+  const realDateNote = 'Nota di sistema: in questo momento sono le ' +
+    new Date().toLocaleString('it-IT', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' }) +
+    ' UTC di ' +
     new Date().toLocaleString('it-IT', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) +
-    ' (data reale in UTC). Usala se ti serve sapere che giorno è oggi o per valutare cosa è "recente" — non indovinarla mai.';
+    '. Questo è l\'unico riferimento di data/ora reale che hai: usalo per calcolare l\'ora locale di una città (conoscendone il fuso), per sapere che giorno è oggi, o per valutare cosa è "recente" — non indovinare mai una data o un orario diverso da questo come base di calcolo.';
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNote };
