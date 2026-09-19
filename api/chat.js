@@ -183,8 +183,16 @@ function parseReActStep(text) {
   const actionMatch = t.match(/ACTION:\s*([a-zA-Z_]+)/i);
   const inputMatch  = t.match(/ACTION_INPUT:\s*([\s\S]*)/i);
   if (actionMatch) return { thought, action: actionMatch[1].trim(), actionInput: inputMatch ? inputMatch[1].trim() : '' };
-  // Formato non riconosciuto: trattalo come risposta finale invece di bloccare il loop
-  return { thought, finalAnswer: t.trim() };
+  // FIX 2026-09-19: trovato nel test 6 — quando la risposta si tronca
+  // (limite di token raggiunto) PRIMA di arrivare a "FINAL_ANSWER:" o
+  // "ACTION:", questo fallback mostrava il testo grezzo intero, etichetta
+  // "THOUGHT:" compresa, come se fosse la risposta finale — risultato:
+  // una frase a metà con "THOUGHT:" in chiaro mostrata all'utente. Ora:
+  // se è stato estratto un ragionamento, usa QUELLO (già ripulito
+  // dall'etichetta) e segnala "truncated", così il chiamante può
+  // ritentare con un passo in più invece di mostrarlo subito com'è.
+  if (thought) return { thought, finalAnswer: thought, truncated: true };
+  return { thought, finalAnswer: t.trim(), truncated: true };
 }
 
 async function executeReActTool(name, input, ctx) {
@@ -684,7 +692,15 @@ export default async function handler(req) {
     new Date().toLocaleString('it-IT', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit' }) +
     ' UTC di ' +
     new Date().toLocaleString('it-IT', { timeZone: 'UTC', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) +
-    '. Questo è l\'unico riferimento di data/ora reale che hai: usalo per calcolare l\'ora locale di una città (conoscendone il fuso), per sapere che giorno è oggi, o per valutare cosa è "recente" — non indovinare mai una data o un orario diverso da questo come base di calcolo.';
+    '. Questo è l\'unico riferimento di data/ora reale che hai: usalo per calcolare l\'ora locale di una città (conoscendone il fuso), per sapere che giorno è oggi, o per valutare cosa è "recente" — non indovinare mai una data o un orario diverso da questo come base di calcolo.' +
+    // FIX 2026-09-19: trovato in un test — per un calcolo percentuale
+    // semplice (uno sconto del 15%) il modello ha scritto la formula in
+    // notazione LaTeX (\[ \text{...} \]). Il sito non ha nessun motore
+    // di rendering matematico (niente MathJax/KaTeX): il risultato è
+    // testo grezzo con le barre rovesciate in chiaro, illeggibile.
+    // Aggiungere una libreria per un caso così semplice è sproporzionato:
+    // basta istruire il modello a non usarla mai.
+    '\n\nNota di sistema: il sito NON supporta la notazione matematica LaTeX (mai usare \\[ \\], \\( \\), $$ o $ per formule) — verrebbe mostrata come testo grezzo illeggibile. Per calcoli e formule usa sempre testo semplice o markdown normale (es. "Prezzo scontato = Prezzo originale × 0,85", oppure una tabella).';
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNote };
@@ -813,6 +829,7 @@ export default async function handler(req) {
       let usedWeb = false;
       let finalAnswer = null;
       let lastActionSignature = null;
+      let truncationRetried = false;
       let lastModelUsed = null, lastProviderUsed = null;
 
       // FIX 2026-09-19: bug reale trovato in test utente — per domande su
@@ -844,7 +861,7 @@ export default async function handler(req) {
 
         let stepText;
         try {
-          const r = await callWithFallback(providers, reactMessages, 700, 0.3, model);
+          const r = await callWithFallback(providers, reactMessages, 1100, 0.3, model);
           stepText = r.text;
           lastModelUsed = r.model; lastProviderUsed = r.provider;
         } catch (e) {
@@ -859,7 +876,7 @@ export default async function handler(req) {
           // pochi secondi, trova provider liberi e risolve da solo.
           console.log('[AI] Agente: passo fallito su entrambi i provider (' + e.message + '), ritento una volta...');
           try {
-            const r2 = await callWithFallback(providers, reactMessages, 700, 0.3, model);
+            const r2 = await callWithFallback(providers, reactMessages, 1100, 0.3, model);
             stepText = r2.text;
             lastModelUsed = r2.model; lastProviderUsed = r2.provider;
           } catch (e2) {
@@ -871,8 +888,19 @@ export default async function handler(req) {
         const parsed = parseReActStep(stepText);
         if (parsed.thought) send({ type: 'agent_thought', thought: parsed.thought, step });
 
-        // Risposta finale: il loop termina qui
-        if (parsed.finalAnswer) { finalAnswer = parsed.finalAnswer; break; }
+        // Risposta finale: il loop termina qui — a meno che non sia
+        // troncata a metà (limite di token raggiunto prima di concludere):
+        // in quel caso un solo tentativo in più, chiedendo di concludere
+        // in modo più conciso, invece di mostrare subito il testo a metà.
+        if (parsed.finalAnswer) {
+          if (parsed.truncated && !truncationRetried) {
+            truncationRetried = true;
+            reactMessages.push({ role: 'assistant', content: stepText });
+            reactMessages.push({ role: 'user', content: '(La risposta precedente si è interrotta per il limite di lunghezza, prima di concludere. Continua e concludi ORA con FINAL_ANSWER, in modo più conciso.)' });
+            continue;
+          }
+          finalAnswer = parsed.finalAnswer; break;
+        }
 
         // Generazione immagine: termina sempre il turno (comportamento invariato rispetto a prima)
         if (parsed.action === 'generate_image') {
