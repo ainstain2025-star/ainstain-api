@@ -1,37 +1,35 @@
 // ════════════════════════════════════════════════════════════════════════
-// lib/imageGen.js — Generazione immagini con provider di backup
+// lib/imageGen.js — Generazione immagini con retry + provider di backup
 // ════════════════════════════════════════════════════════════════════════
-// Creato 2026-09-19 dopo aver confermato (con chiamate dirette di test)
-// che Pollinations, nell'arco di pochi minuti, può rispondere con errori
-// diversi e scorrelati tra loro (500, timeout, 429 rate-limit) sulla stessa
-// identica richiesta che prima funzionava — un'instabilità reale e attuale
-// del servizio gratuito, non un bug nostro. Prima, la generazione immagine
-// non veniva MAI verificata lato server: il backend costruiva l'URL e lo
-// mandava al client senza sapere se avrebbe funzionato.
+// Creato 2026-09-19, aggiornato 2026-09-20 dopo due scoperte concrete con
+// test dal vivo:
+//   1. Pollinations, nell'arco di pochi minuti, può rispondere con errori
+//      diversi e scorrelati (500, timeout, 429) sulla stessa identica
+//      richiesta che prima funzionava — instabilità reale e intermittente,
+//      non un bug nostro. Un secondo tentativo spesso basta.
+//   2. Il vecchio endpoint Hugging Face "api-inference.huggingface.co" non
+//      esiste più (DNS non risolve: "getaddrinfo ENOTFOUND") — Hugging Face
+//      lo ha sostituito con un sistema di "Inference Providers" instradato
+//      dietro router.huggingface.co, richiede la loro libreria ufficiale
+//      invece di un URL REST fisso (la struttura cambia in base al modello
+//      e al provider di calcolo scelto). Vedi package.json: serve la
+//      dipendenza "@huggingface/inference".
 //
 // Ora questo modulo:
-//   1. Prova Pollinations, verificando DAVVERO che risponda con un'immagine
-//      valida (non solo costruendo l'URL alla cieca).
-//   2. Se fallisce, prova un secondo provider gratuito indipendente
-//      (Hugging Face Inference API, modello stabilityai/sd-turbo) come
-//      riserva — stesso principio già usato per il testo con Groq+OpenRouter.
+//   1. Prova Pollinations FINO A 2 VOLTE (con una breve pausa tra i tentativi),
+//      verificando DAVVERO che risponda con un'immagine valida.
+//   2. Se fallisce comunque, prova Hugging Face come riserva (via libreria
+//      ufficiale) — stesso principio già usato per il testo con Groq+OpenRouter.
 //   3. Se anche quello fallisce (o non è configurato), propaga l'errore
 //      così il chiamante può mostrare un messaggio onesto.
 //
 // CONFIGURAZIONE RICHIESTA per il fallback (opzionale ma consigliata):
-// variabile d'ambiente HUGGINGFACE_API_KEY su Vercel — gratuita:
-// huggingface.co → Settings → Access Tokens → New token (permessi "Read").
-// Senza questa chiave, il modulo funziona comunque, usando solo Pollinations
-// (comportamento equivalente a prima, ma con verifica reale invece che alla cieca).
-
-// Edge Runtime non ha Buffer (Node.js); usiamo btoa (API web-standard)
-// convertendo prima l'ArrayBuffer in una stringa binaria byte-per-byte.
-function arrayBufferToBase64(buf) {
-  let binary = '';
-  const bytes = new Uint8Array(buf);
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
+// 1. variabile d'ambiente HUGGINGFACE_API_KEY su Vercel — gratuita:
+//    huggingface.co → Settings → Access Tokens → New token, permesso
+//    "Make calls to Inference Providers".
+// 2. dipendenza "@huggingface/inference" aggiunta a package.json.
+// Senza queste due cose, il modulo funziona comunque, usando solo
+// Pollinations (ma con verifica reale e retry, non più alla cieca).
 
 export function buildPollinationsUrl(prompt, opts = {}) {
   const width  = opts.width  || 1024;
@@ -47,7 +45,7 @@ export function buildPollinationsUrl(prompt, opts = {}) {
 // Prova a scaricare davvero l'immagine da un URL, con timeout, verificando
 // che la risposta sia effettivamente un'immagine valida (non un errore
 // travestito da 200, e non una pagina di errore HTML).
-async function verifyImageUrl(url, timeoutMs = 15000) {
+async function verifyImageUrlOnce(url, timeoutMs) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -61,77 +59,69 @@ async function verifyImageUrl(url, timeoutMs = 15000) {
   }
 }
 
-// Fallback: Hugging Face Inference API, modello leggero e veloce (sd-turbo).
-// x-wait-for-model: true → se il modello è "in caricamento" (cold start),
-// HF aspetta invece di rispondere subito 503 (evita un fallimento inutile
-// al primo utilizzo dopo un periodo di inattività del modello).
-async function generateWithHuggingFace(prompt, hfKey, timeoutMs = 25000) {
-  // DIFESA 2026-09-20: una chiave incollata da Vercel/HF può portarsi dietro
-  // uno spazio o un a-capo accidentale — un header Authorization con un
-  // carattere di controllo non è valido e fetch() lo rifiuta con un errore
-  // generico ("internal error") che non spiega la vera causa.
+// NUOVO 2026-09-20: fino a `attempts` tentativi con pausa breve tra uno e
+// l'altro — dato che i fallimenti osservati sono intermittenti (non sempre
+// lo stesso errore sulla stessa identica richiesta), un secondo tentativo
+// ha buone probabilità di funzionare quando il primo fallisce.
+async function verifyImageUrlWithRetry(url, attempts = 2, timeoutMs = 12000) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await verifyImageUrlOnce(url, timeoutMs);
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.log('[imageGen] Pollinations tentativo', i + 1, 'di', attempts, 'fallito:', e.message);
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  throw lastErr;
+}
+
+// Fallback: Hugging Face, via libreria ufficiale "@huggingface/inference".
+// NOTA 2026-09-20: prima chiamavamo direttamente "api-inference.huggingface.co"
+// con fetch() — quel dominio non esiste più (DNS non risolve). Hugging Face
+// ha spostato tutto dietro un sistema di "Inference Providers" (router.huggingface.co)
+// la cui struttura varia per modello/provider di calcolo, quindi usiamo la
+// loro libreria ufficiale invece di indovinare l'URL a mano.
+async function generateWithHuggingFace(prompt, hfKey) {
   const cleanHfKey = String(hfKey || '').trim();
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
+  let InferenceClient;
   try {
-    res = await fetch('https://api-inference.huggingface.co/models/stabilityai/sd-turbo', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + cleanHfKey,
-        'Content-Type': 'application/json',
-        'x-wait-for-model': 'true',
-      },
-      body: JSON.stringify({ inputs: prompt }),
-      signal: controller.signal,
-    });
-  } catch (fetchErr) {
-    // Errore a livello di rete/trasporto (non una risposta HTTP con status):
-    // catturiamo nome + messaggio + eventuale "cause" per capire la vera origine
-    // invece del generico "internal error" che altrimenti arriverebbe nudo.
+    ({ InferenceClient } = await import('@huggingface/inference'));
+  } catch (importErr) {
     throw new Error(
-      'Hugging Face — errore di rete prima di ricevere risposta: ' +
-      (fetchErr && fetchErr.name ? fetchErr.name + ': ' : '') +
-      (fetchErr && fetchErr.message ? fetchErr.message : String(fetchErr)) +
-      (fetchErr && fetchErr.cause ? ' | cause: ' + String(fetchErr.cause) : '')
+      'Libreria "@huggingface/inference" non installata — aggiungila a package.json ' +
+      '(dependencies) e fai un nuovo deploy. Dettaglio: ' + String(importErr.message || importErr)
     );
-  } finally {
-    clearTimeout(t);
   }
-  try {
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error('Hugging Face ' + res.status + ' ' + errText.slice(0, 200));
-    }
-    const contentType = res.headers.get('content-type') || 'image/jpeg';
-    if (!contentType.startsWith('image/')) {
-      const errText = await res.text().catch(() => '');
-      throw new Error('Hugging Face risposta non-immagine: ' + errText.slice(0, 200));
-    }
-    const buf = await res.arrayBuffer();
-    // NOTA: questo file gira su Vercel Edge Runtime, che NON ha l'oggetto
-    // Buffer di Node.js — serve una conversione manuale in base64 con API
-    // web-standard (btoa), altrimenti la funzione crasha silenziosamente.
-    const base64 = arrayBufferToBase64(buf);
-    return `data:${contentType};base64,${base64}`;
-  } finally {
-    clearTimeout(t);
-  }
+  const client = new InferenceClient(cleanHfKey);
+  // FLUX.1-schnell: variante veloce, adatta al livello gratuito dei provider
+  // dietro Inference Providers (la stessa famiglia di modello già usata da
+  // Pollinations, quindi qualità comparabile).
+  const blob = await client.textToImage({
+    model: 'black-forest-labs/FLUX.1-schnell',
+    inputs: prompt,
+  });
+  const arrayBuf = await blob.arrayBuffer();
+  const contentType = blob.type || 'image/jpeg';
+  const base64 = Buffer.from(arrayBuf).toString('base64'); // Node.js runtime: Buffer disponibile
+  return `data:${contentType};base64,${base64}`;
 }
 
 /**
- * Genera un'immagine con fallback automatico tra provider.
+ * Genera un'immagine con retry + fallback automatico tra provider.
  * @returns {Promise<{url: string, provider: string}>}
  */
 export async function generateImageWithFallback(prompt, opts = {}) {
   const pollinationsUrl = buildPollinationsUrl(prompt, opts);
 
   try {
-    await verifyImageUrl(pollinationsUrl);
+    await verifyImageUrlWithRetry(pollinationsUrl, 2);
     console.log('[imageGen] Pollinations OK');
     return { url: pollinationsUrl, provider: 'Pollinations' };
   } catch (errPollinations) {
-    console.log('[imageGen] Pollinations fallito:', errPollinations.message, '| hfKey presente:', !!opts.hfKey);
+    console.log('[imageGen] Pollinations fallito dopo i retry:', errPollinations.message, '| hfKey presente:', !!opts.hfKey);
     if (opts.hfKey) {
       try {
         const dataUrl = await generateWithHuggingFace(prompt, opts.hfKey);
