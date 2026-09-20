@@ -214,14 +214,24 @@ async function executeReActTool(name, input, ctx) {
     case 'web_search': {
       if (!ctx.tavilyKey) return 'Ricerca web non disponibile in questo momento.';
       try {
-        const result = await tavilySearch((input || '').slice(0, 150), ctx.tavilyKey);
+        const q = (input || '').slice(0, 150);
+        const result = await tavilySearch(q, ctx.tavilyKey);
+        // LOG DIAGNOSTICO 2026-09-20: aggiunto dopo un caso confermato di
+        // risposta sbagliata (vincitore Wimbledon 2026 inventato) nonostante
+        // l'Agente dichiarasse di aver cercato — senza questo log non era
+        // possibile distinguere "Tavily ha restituito risultati sbagliati/
+        // vecchi" da "il modello ha ignorato risultati corretti".
+        console.log('[web_search] query:', q, '| risultato (primi 400 char):', String(result).slice(0, 400));
         // FIX 2026-09-19: i risultati Tavily (fino a 5, con snippet lunghi)
         // venivano inseriti per intero nella conversazione, senza taglio —
         // confermato dai log Vercel come concausa del superamento del
         // tetto Groq di 8000 token/minuto (errore 413). Tagliato a 1200
         // caratteri (~300 token): riduce il peso senza svuotare il senso.
         return result.length > 1200 ? result.slice(0, 1200) + '…' : result;
-      } catch (e) { return 'Ricerca fallita: ' + e.message; }
+      } catch (e) {
+        console.log('[web_search] fallita:', e.message);
+        return 'Ricerca fallita: ' + e.message;
+      }
     }
     default:
       return 'Strumento "' + name + '" non riconosciuto.';
@@ -1037,4 +1047,3 @@ export default async function handler(req) {
     return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
   }
 }
-  
