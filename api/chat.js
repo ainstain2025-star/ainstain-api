@@ -2,6 +2,7 @@ export const config = { runtime: 'edge', maxDuration: 60 };
 
 import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
+import { generateImageWithFallback } from './lib/imageGen.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
 // NOTA su OpenRouter (fallback): il catalogo dei modelli gratuiti cambia
@@ -274,14 +275,8 @@ function getLastUserText(messages) {
   const m = [...messages].reverse().find(m => m.role === 'user');
   return m ? extractText(m.content) : '';
 }
-function buildPollinationsUrl(prompt) {
-  // referrer: metodo di autenticazione ufficiale per app web (nessuna
-  // registrazione necessaria) — migliora il riconoscimento del rate limit.
-  // enhance=true: un modello lato Pollinations arricchisce il prompt prima
-  // della generazione, aiuta con anatomia/proporzioni.
-  const seed = Math.floor(Math.random() * 1000000);
-  return 'https://image.pollinations.ai/prompt/' + encodeURIComponent(prompt) + '?width=1024&height=1024&nologo=true&model=flux&enhance=true&seed=' + seed + '&referrer=ainstain.site';
-}
+// NOTA 2026-09-19: buildPollinationsUrl ora vive in ./lib/imageGen.js
+// insieme al provider di backup (Hugging Face) — vedi generateImageWithFallback.
 
 async function tavilySearch(query, apiKey) {
   const res = await fetch('https://api.tavily.com/search', {
@@ -669,6 +664,9 @@ export default async function handler(req) {
 
   const groqKey   = process.env.GROQ_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
+  // Opzionale: se assente, la generazione immagine usa solo Pollinations
+  // (come prima, ma ora con verifica reale invece che alla cieca).
+  const hfKey     = process.env.HUGGINGFACE_API_KEY;
   if (!groqKey) return new Response(JSON.stringify({ error: 'GROQ_API_KEY mancante' }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
 
   const providers  = getProviders(process.env);
@@ -906,7 +904,17 @@ export default async function handler(req) {
         if (parsed.action === 'generate_image') {
           send({ type: 'agent_tools', tools: ['generate_image'] });
           const imgPrompt = parsed.actionInput || userText;
-          send({ type: 'agent_image', url: buildPollinationsUrl(imgPrompt + ', high quality, detailed, artistic'), prompt: imgPrompt });
+          // FIX 2026-09-19: prima l'URL veniva costruito e mandato al client
+          // alla cieca, senza sapere se Pollinations avrebbe davvero risposto
+          // — se falliva, l'utente vedeva un'immagine rotta. Ora verifichiamo
+          // davvero lato server, con un secondo provider di riserva
+          // (Hugging Face) se configurato e se Pollinations non risponde.
+          try {
+            const result = await generateImageWithFallback(imgPrompt + ', high quality, detailed, artistic', { hfKey });
+            send({ type: 'agent_image', url: result.url, prompt: imgPrompt, provider: result.provider });
+          } catch (imgErr) {
+            send({ type: 'error', message: '⚠️ Non sono riuscito a generare l\'immagine: i provider disponibili (Pollinations' + (hfKey ? ' e Hugging Face' : '') + ') non hanno risposto. Riprova tra qualche istante.', overloaded: true });
+          }
           return;
         }
 
@@ -1029,3 +1037,4 @@ export default async function handler(req) {
     return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { ...cors, 'Content-Type': 'application/json' } });
   }
 }
+  
