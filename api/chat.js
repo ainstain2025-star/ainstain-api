@@ -860,7 +860,15 @@ export default async function handler(req) {
         reactMessages.push({ role: 'assistant', content: 'THOUGHT: La domanda riguarda informazioni in tempo reale, cerco prima sul web.\nACTION: web_search\nACTION_INPUT: ' + userText });
         reactMessages.push({
           role: 'user',
-          content: 'OBSERVATION: ' + forcedObservation + '\n\n(Hai già qui sopra i risultati della ricerca web. Usali per rispondere con FINAL_ANSWER. Se non contengono l\'informazione richiesta — o la ricerca non ha dato risultati utili — dillo chiaramente all\'utente invece di inventare date, prezzi o notizie.)'
+          content: 'OBSERVATION: ' + forcedObservation + '\n\n(Hai già qui sopra i risultati della ricerca web. Usali per rispondere con FINAL_ANSWER. Se non contengono l\'informazione richiesta — o la ricerca non ha dato risultati utili — dillo chiaramente all\'utente invece di inventare date, prezzi o notizie. ' +
+            // FIX 2026-09-20: trovato con test dal vivo — "chi ha vinto l'ultimo
+            // Roland Garros/Wimbledon" restituiva da Tavily SOLO il vincitore
+            // maschile (a volte pure con l'anno sbagliato), e il modello
+            // completava da solo il dato femminile mancante con un nome reale
+            // ma sbagliato, invece di segnalare che mancava. L'istruzione sopra
+            // copre solo il caso "zero risultati utili", non quello di risultati
+            // PARZIALI su una domanda con più parti.
+            'ATTENZIONE PARTICOLARE: se la domanda ha più parti (es. categoria maschile E femminile, più città, più persone) e i risultati sopra coprono SOLO ALCUNE di quelle parti, NON completare le parti mancanti con nomi/dati che conosci da altre fonti o dal tuo addestramento — anche se sembrano plausibili e sono persone/fatti reali, potrebbero essere sbagliati o non aggiornati per QUESTO caso specifico. Per la parte mancante, di\' esplicitamente che la ricerca non ha restituito quel dato.)'
         });
       }
 
