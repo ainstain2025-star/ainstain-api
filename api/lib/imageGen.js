@@ -66,19 +66,39 @@ async function verifyImageUrl(url, timeoutMs = 15000) {
 // HF aspetta invece di rispondere subito 503 (evita un fallimento inutile
 // al primo utilizzo dopo un periodo di inattività del modello).
 async function generateWithHuggingFace(prompt, hfKey, timeoutMs = 25000) {
+  // DIFESA 2026-09-20: una chiave incollata da Vercel/HF può portarsi dietro
+  // uno spazio o un a-capo accidentale — un header Authorization con un
+  // carattere di controllo non è valido e fetch() lo rifiuta con un errore
+  // generico ("internal error") che non spiega la vera causa.
+  const cleanHfKey = String(hfKey || '').trim();
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
   try {
-    const res = await fetch('https://api-inference.huggingface.co/models/stabilityai/sd-turbo', {
+    res = await fetch('https://api-inference.huggingface.co/models/stabilityai/sd-turbo', {
       method: 'POST',
       headers: {
-        'Authorization': 'Bearer ' + hfKey,
+        'Authorization': 'Bearer ' + cleanHfKey,
         'Content-Type': 'application/json',
         'x-wait-for-model': 'true',
       },
       body: JSON.stringify({ inputs: prompt }),
       signal: controller.signal,
     });
+  } catch (fetchErr) {
+    // Errore a livello di rete/trasporto (non una risposta HTTP con status):
+    // catturiamo nome + messaggio + eventuale "cause" per capire la vera origine
+    // invece del generico "internal error" che altrimenti arriverebbe nudo.
+    throw new Error(
+      'Hugging Face — errore di rete prima di ricevere risposta: ' +
+      (fetchErr && fetchErr.name ? fetchErr.name + ': ' : '') +
+      (fetchErr && fetchErr.message ? fetchErr.message : String(fetchErr)) +
+      (fetchErr && fetchErr.cause ? ' | cause: ' + String(fetchErr.cause) : '')
+    );
+  } finally {
+    clearTimeout(t);
+  }
+  try {
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
       throw new Error('Hugging Face ' + res.status + ' ' + errText.slice(0, 200));
@@ -108,13 +128,17 @@ export async function generateImageWithFallback(prompt, opts = {}) {
 
   try {
     await verifyImageUrl(pollinationsUrl);
+    console.log('[imageGen] Pollinations OK');
     return { url: pollinationsUrl, provider: 'Pollinations' };
   } catch (errPollinations) {
+    console.log('[imageGen] Pollinations fallito:', errPollinations.message, '| hfKey presente:', !!opts.hfKey);
     if (opts.hfKey) {
       try {
         const dataUrl = await generateWithHuggingFace(prompt, opts.hfKey);
+        console.log('[imageGen] Hugging Face OK');
         return { url: dataUrl, provider: 'Hugging Face (backup)' };
       } catch (errHf) {
+        console.log('[imageGen] Hugging Face fallito:', errHf.message);
         throw new Error(
           'Entrambi i provider immagine hanno fallito. Pollinations: ' + errPollinations.message +
           ' | Hugging Face: ' + errHf.message
