@@ -31,6 +31,29 @@
 // Senza queste due cose, il modulo funziona comunque, usando solo
 // Pollinations (ma con verifica reale e retry, non più alla cieca).
 
+// ── DIZIONARIO STILI DI NICCHIA/RECENTI (2026-09-21) ─────────────────────
+// Stessa logica già aggiunta lato client in index_AI.html (modalità diretta,
+// enhanceImagePrompt) — replicata qui perché la modalità Agente NON passa da
+// enhanceImagePrompt: costruisce il prompt immagine da sola in chat.js e lo
+// manda direttamente a questo modulo. Duplicare qui evita che l'Agente perda
+// lo stesso fix. Vedi checklist sezione 16 per il dettaglio del problema
+// originale (stile "genmoji" non fedele perché il modello non conosce il
+// termine, indipendentemente da chi arricchisce il prompt).
+const NICHE_STYLE_HINTS = {
+  'genmoji': '3D soft clay-like rendering, glossy plastic/clay material, thick white outline border, rounded minimal shapes, big simple eyes, cute Apple Genmoji sticker aesthetic, isolated on plain white background',
+};
+
+function applyNicheStyleHints(prompt) {
+  const lower = String(prompt || '').toLowerCase();
+  let result = prompt;
+  for (const keyword in NICHE_STYLE_HINTS) {
+    if (lower.includes(keyword)) {
+      result += `, ${NICHE_STYLE_HINTS[keyword]}`;
+    }
+  }
+  return result;
+}
+
 export function buildPollinationsUrl(prompt, opts = {}) {
   const width  = opts.width  || 1024;
   const height = opts.height || 1024;
@@ -109,12 +132,99 @@ async function generateWithHuggingFace(prompt, hfKey) {
   return `data:${contentType};base64,${base64}`;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// EDITING REALE DI IMMAGINI CARICATE (image-to-image) — aggiunto 2026-09-27
+// ════════════════════════════════════════════════════════════════════════
+// Gap scoperto in test dal vivo: l'utente carica una foto e chiede di
+// trasformarla (stile, sfondo, aggiunte) — prima d'ora AInstAIn non aveva
+// NESSUNA pipeline che accettasse un'immagine in ingresso E restituisse
+// un'immagine modificata in uscita. La "analisi immagine" (Qwen Vision)
+// legge un'immagine e produce solo testo; `generateImageWithFallback` sopra
+// genera un'immagine nuova da zero, ma non accetta un'immagine di partenza.
+//
+// Qui usiamo lo stesso principio/libreria già in uso per il fallback di
+// generazione (@huggingface/inference), ma il metodo `imageToImage` invece
+// di `textToImage`, col modello black-forest-labs/FLUX.1-Kontext-dev
+// (pensato apposta per l'editing guidato da istruzioni testuali, mantiene
+// il soggetto/composizione originale invece di reinventare l'immagine).
+//
+// COSTO REALE VERIFICATO (2026-09-27, da documentazione ufficiale Hugging
+// Face): un account HF gratuito riceve $0.10/mese di credito per "Inference
+// Providers" — condiviso con QUALSIASI altra chiamata a questa stessa API,
+// incluso il fallback di generazione testo→immagine già in uso sopra. Non è
+// "gratis illimitato": è una quota molto piccola e condivisa. L'editing
+// (modello più pesante di FLUX.1-schnell) probabilmente consuma quella
+// quota più in fretta della generazione normale. Nessun costo per attivare
+// la funzione (stessa chiave già configurata), ma la capacità reale è
+// limitata — da monitorare, non da trattare come risorsa infinita.
+async function editWithHuggingFace(imageInput, instruction, hfKey) {
+  const cleanHfKey = String(hfKey || '').trim();
+  if (!cleanHfKey) {
+    throw new Error(
+      'Editing immagini non configurato: manca HUGGINGFACE_API_KEY. ' +
+      'Senza questa chiave l\'editing di immagini caricate non è disponibile ' +
+      '(a differenza della generazione da testo, che ha Pollinations come principale).'
+    );
+  }
+  let InferenceClient;
+  try {
+    ({ InferenceClient } = await import('@huggingface/inference'));
+  } catch (importErr) {
+    throw new Error(
+      'Libreria "@huggingface/inference" non installata — aggiungila a package.json ' +
+      '(dependencies) e fai un nuovo deploy. Dettaglio: ' + String(importErr.message || importErr)
+    );
+  }
+  const client = new InferenceClient(cleanHfKey);
+  // client.imageToImage accetta Buffer/Blob come immagine di input.
+  const outputBlob = await client.imageToImage({
+    model: 'black-forest-labs/FLUX.1-Kontext-dev',
+    inputs: imageInput,
+    parameters: { prompt: instruction },
+  });
+  const arrayBuf = await outputBlob.arrayBuffer();
+  const contentType = outputBlob.type || 'image/jpeg';
+  const base64 = Buffer.from(arrayBuf).toString('base64');
+  return `data:${contentType};base64,${base64}`;
+}
+
+/**
+ * Modifica un'immagine esistente in base a un'istruzione testuale
+ * (image-to-image). A differenza di generateImageWithFallback, NON ha
+ * Pollinations come opzione: Pollinations genera solo da testo, non
+ * accetta un'immagine di partenza da modificare. Hugging Face è quindi
+ * l'UNICO provider per questa funzione — se non configurato o se fallisce,
+ * l'errore va propagato onestamente (nessun secondo fallback disponibile
+ * oggi per questa capacità specifica).
+ * @param {string} imageDataUrl - data URL (data:image/...;base64,...) dell'immagine caricata dall'utente
+ * @param {string} instruction - istruzione testuale (es. "trasforma in stile anime, rimuovi lo sfondo")
+ * @param {{hfKey?: string}} opts
+ * @returns {Promise<{url: string, provider: string}>}
+ */
+export async function editImageWithFallback(imageDataUrl, instruction, opts = {}) {
+  const match = /^data:([^;]+);base64,(.+)$/.exec(String(imageDataUrl || ''));
+  if (!match) {
+    throw new Error('Formato immagine non valido: atteso un data URL base64 (data:image/...;base64,...).');
+  }
+  const imageBuffer = Buffer.from(match[2], 'base64');
+
+  try {
+    const dataUrl = await editWithHuggingFace(imageBuffer, instruction, opts.hfKey);
+    console.log('[imageGen] Editing Hugging Face OK');
+    return { url: dataUrl, provider: 'Hugging Face (FLUX.1 Kontext)' };
+  } catch (err) {
+    console.log('[imageGen] Editing Hugging Face fallito:', err.message);
+    throw err;
+  }
+}
+
 /**
  * Genera un'immagine con retry + fallback automatico tra provider.
  * @returns {Promise<{url: string, provider: string}>}
  */
 export async function generateImageWithFallback(prompt, opts = {}) {
-  const pollinationsUrl = buildPollinationsUrl(prompt, opts);
+  const augmentedPrompt = applyNicheStyleHints(prompt);
+  const pollinationsUrl = buildPollinationsUrl(augmentedPrompt, opts);
 
   try {
     await verifyImageUrlWithRetry(pollinationsUrl, 2);
@@ -124,7 +234,7 @@ export async function generateImageWithFallback(prompt, opts = {}) {
     console.log('[imageGen] Pollinations fallito dopo i retry:', errPollinations.message, '| hfKey presente:', !!opts.hfKey);
     if (opts.hfKey) {
       try {
-        const dataUrl = await generateWithHuggingFace(prompt, opts.hfKey);
+        const dataUrl = await generateWithHuggingFace(augmentedPrompt, opts.hfKey);
         console.log('[imageGen] Hugging Face OK');
         return { url: dataUrl, provider: 'Hugging Face (backup)' };
       } catch (errHf) {
