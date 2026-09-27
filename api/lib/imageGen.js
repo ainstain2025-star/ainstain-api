@@ -157,7 +157,7 @@ async function generateWithHuggingFace(prompt, hfKey) {
 // quota più in fretta della generazione normale. Nessun costo per attivare
 // la funzione (stessa chiave già configurata), ma la capacità reale è
 // limitata — da monitorare, non da trattare come risorsa infinita.
-async function editWithHuggingFace(imageInput, instruction, hfKey) {
+async function editWithHuggingFace(imageInput, mimeType, instruction, hfKey) {
   const cleanHfKey = String(hfKey || '').trim();
   if (!cleanHfKey) {
     throw new Error(
@@ -176,10 +176,16 @@ async function editWithHuggingFace(imageInput, instruction, hfKey) {
     );
   }
   const client = new InferenceClient(cleanHfKey);
-  // client.imageToImage accetta Buffer/Blob come immagine di input.
+  // FIX 2026-09-27 (trovato dopo il primo test dal vivo, fallito): la
+  // documentazione ufficiale della libreria specifica che `inputs` deve
+  // essere un vero oggetto Blob, non un Buffer Node.js grezzo — passare
+  // direttamente il Buffer (come nel primo tentativo) probabilmente veniva
+  // rifiutato o gestito male dalla libreria, causando il fallimento visto
+  // in produzione ("Non sono riuscito a modificare l'immagine").
+  const imageBlob = new Blob([imageInput], { type: mimeType || 'image/jpeg' });
   const outputBlob = await client.imageToImage({
     model: 'black-forest-labs/FLUX.1-Kontext-dev',
-    inputs: imageInput,
+    inputs: imageBlob,
     parameters: { prompt: instruction },
   });
   const arrayBuf = await outputBlob.arrayBuffer();
@@ -206,10 +212,11 @@ export async function editImageWithFallback(imageDataUrl, instruction, opts = {}
   if (!match) {
     throw new Error('Formato immagine non valido: atteso un data URL base64 (data:image/...;base64,...).');
   }
+  const mimeType = match[1];
   const imageBuffer = Buffer.from(match[2], 'base64');
 
   try {
-    const dataUrl = await editWithHuggingFace(imageBuffer, instruction, opts.hfKey);
+    const dataUrl = await editWithHuggingFace(imageBuffer, mimeType, instruction, opts.hfKey);
     console.log('[imageGen] Editing Hugging Face OK');
     return { url: dataUrl, provider: 'Hugging Face (FLUX.1 Kontext)' };
   } catch (err) {
