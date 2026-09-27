@@ -183,8 +183,23 @@ async function editWithHuggingFace(imageInput, mimeType, instruction, hfKey) {
   // rifiutato o gestito male dalla libreria, causando il fallimento visto
   // in produzione ("Non sono riuscito a modificare l'immagine").
   const imageBlob = new Blob([imageInput], { type: mimeType || 'image/jpeg' });
+  // FIX #2 2026-09-27 (trovato dai log Vercel del secondo test dal vivo, ancora
+  // fallito): l'errore reale era "Task 'image-to-image' not supported for
+  // provider 'fal-ai'" — con provider lasciato su "auto", la libreria aveva
+  // scelto 'fal-ai' per il modello FLUX.1-Kontext-dev, ma quella combinazione
+  // specifica su Hugging Face Inference Providers non espone il task
+  // image-to-image (nonostante fal.ai stesso, usato direttamente, supporti
+  // Kontext per l'editing — è un limite dell'instradamento attuale di HF, non
+  // del modello in sé). Cambiato a `black-forest-labs/FLUX.2-klein-9B` con
+  // `provider: 'fal-ai'` ESPLICITO (non più "auto") — è esattamente la
+  // combinazione modello+provider usata come esempio ufficiale nella
+  // documentazione Hugging Face per image-to-image, quindi confermata
+  // funzionante lato loro. Se anche questa combinazione dovesse fallire, il
+  // prossimo passo è provare `provider: 'replicate'` o `'together'` (elencati
+  // come endpoint compatibili con FLUX.1 Kontext nella pagina del modello).
   const outputBlob = await client.imageToImage({
-    model: 'black-forest-labs/FLUX.1-Kontext-dev',
+    model: 'black-forest-labs/FLUX.2-klein-9B',
+    provider: 'fal-ai',
     inputs: imageBlob,
     parameters: { prompt: instruction },
   });
