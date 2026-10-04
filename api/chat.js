@@ -829,8 +829,17 @@ export default async function handler(req) {
 
         send({ type: 'multi_judging' });
         const judgeSystemPrompt = 'Sintetizza risposte AI in italiano, preciso e completo.' + (needsSensitiveDisclaimer(userText) ? SENSITIVE_DISCLAIMER_INSTRUCTION : '');
+        // FIX 2026-10-04 (parte 2): stesso identico bug del fix precedente,
+        // ma qui nel passo di SINTESI/GIUDICE invece che nelle 3 chiamate
+        // individuali. Trovato con un secondo test reale: le 3 risposte
+        // arrivavano bene ("Best-of-N: 3/3 responded" nei log), ma poi
+        // questa chiamata al modello giudice (che riceve in un unico prompt
+        // la domanda + tutte e 3 le risposte, quindi un testo grande) usava
+        // SOLO Groq senza riserva OpenRouter — andava in errore 413 "Request
+        // too large" e l'utente vedeva comunque "Errore del server (500)"
+        // nonostante le 3 risposte individuali fossero già arrivate.
         const judgeResult = await callWithFallback(
-          [{ ...providers[0], model: JUDGE_MODEL }],
+          [{ ...providers[0], model: JUDGE_MODEL }, ...providers.slice(1)],
           [{ role: 'system', content: judgeSystemPrompt }, { role: 'user', content: judgePrompt }],
           maxTokens, 0.3, JUDGE_MODEL
         );
