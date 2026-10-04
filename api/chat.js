@@ -32,8 +32,15 @@ const PROVIDER_CHAIN = [
 // console.groq.com/docs/models e /docs/vision, fonte ufficiale, appena
 // consultata): openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.6-27b
 // (quest'ultimo multimodale, copre anche il caso Vision sotto).
+// AGGIORNAMENTO 2026-10-04: Groq ha rinominato "qwen/qwen3.6-27b" in
+// "qwen/qwen3.8-27b" (stesso modello Vision multimodale, nuova versione
+// — verificato su console.groq.com/docs/model/qwen/qwen3.8-27b, fonte
+// ufficiale). Il nome vecchio dava errore 404 "model not found" su OGNI
+// richiesta Best-of-N — trovato in un test reale con upload PDF, dove
+// tutti e 3 i tentativi Best-of-N fallivano (0/3 responded) e l'utente
+// vedeva "Errore del server (500)".
 const MULTI_MODELS = [
-  { id: 'qwen/qwen3.6-27b',       name: 'Qwen 3.6 27B' },
+  { id: 'qwen/qwen3.8-27b',       name: 'Qwen 3.8 27B' },
   { id: 'openai/gpt-oss-120b',     name: 'GPT-OSS 120B' },
   { id: 'openai/gpt-oss-20b',      name: 'GPT-OSS 20B'  },
 ];
@@ -65,7 +72,7 @@ const JUDGE_MODEL = 'openai/gpt-oss-20b';
 const GROQ_FALLBACK_MODELS = [
   'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
-  'qwen/qwen3.6-27b',
+  'qwen/qwen3.8-27b',
 ];
 
 // Memoria (per istanza) dei modelli risultati inesistenti: evita di
@@ -784,9 +791,23 @@ export default async function handler(req) {
       } else {
         // Best: tutti in parallelo + giudice
         send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
+        // FIX 2026-10-04: prima si passava SOLO il provider Groq
+        // (`[{ ...providers[0], model: m.id }]`) per ciascuno dei 3
+        // modelli — a differenza della chat normale, che passa l'intera
+        // catena `providers` (Groq + OpenRouter di riserva). Risultato:
+        // se Groq rifiutava (es. errore 413 "Request too large" per un
+        // documento allegato grande, oltre il limite di 8000 token/minuto
+        // del piano gratuito), Best-of-N non aveva NESSUN paracadute e
+        // falliva su tutti e 3 i tentativi insieme ("Best-of-N: 0/3
+        // responded" nei log), mostrando all'utente un errore 500 anche
+        // se OpenRouter sarebbe stato perfettamente in grado di rispondere
+        // (lo fa regolarmente nella chat normale). Trovato con un test
+        // reale: upload di un PDF che produceva ~23.800 token di richiesta.
+        // Ora ogni modello ha anche OpenRouter come riserva, esattamente
+        // come il resto del codice.
         const results = await Promise.allSettled(
           MULTI_MODELS.map(m =>
-            callWithFallback([{ ...providers[0], model: m.id }], disclaimedMessages, Math.min(maxTokens, 768), temperature, m.id)
+            callWithFallback([{ ...providers[0], model: m.id }, ...providers.slice(1)], disclaimedMessages, Math.min(maxTokens, 768), temperature, m.id)
               .then(r => ({ model: m.name, text: r.text }))
           )
         );
