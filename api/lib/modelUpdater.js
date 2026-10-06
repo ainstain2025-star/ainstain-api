@@ -74,7 +74,7 @@ export const TESTS = [
   },
   {
     name: 'lettura foto',
-    applies: (roles) => roles.includes('vision') || roles.includes('multi'),
+    applies: (roles) => roles.includes('vision'), // i modelli solo-testo (GPT-OSS) non leggono foto: non vanno provati
     build: () => ({
       messages: [{ role: 'user', content: [
         { type: 'text', text: "Quale testo e quali numeri sono scritti nell'immagine? Rispondi solo con quello che leggi." },
