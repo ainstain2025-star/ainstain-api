@@ -3,6 +3,7 @@ export const config = { runtime: 'edge', maxDuration: 60 };
 import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
 import { generateImageWithFallback } from './lib/imageGen.js';
+import { loadConfig, prettyName } from './lib/modelConfig.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
 // NOTA su OpenRouter (fallback): il catalogo dei modelli gratuiti cambia
@@ -39,12 +40,14 @@ const PROVIDER_CHAIN = [
 // richiesta Best-of-N — trovato in un test reale con upload PDF, dove
 // tutti e 3 i tentativi Best-of-N fallivano (0/3 responded) e l'utente
 // vedeva "Errore del server (500)".
-const MULTI_MODELS = [
+let MULTI_MODELS = [
   { id: 'qwen/qwen3.8-27b',       name: 'Qwen 3.8 27B' },
   { id: 'openai/gpt-oss-120b',     name: 'GPT-OSS 120B' },
   { id: 'openai/gpt-oss-20b',      name: 'GPT-OSS 20B'  },
 ];
-const JUDGE_MODEL = 'openai/gpt-oss-20b';
+let JUDGE_MODEL = 'openai/gpt-oss-20b';
+let ACTIVE_MAIN = 'openai/gpt-oss-120b';
+let ACTIVE_FAST = 'openai/gpt-oss-20b';
 
 // ══════════════════════════════════════════════════════════════════════
 // AUTO-RIPARAZIONE MODELLI (aggiunto 2026-09-11)
@@ -69,7 +72,7 @@ const JUDGE_MODEL = 'openai/gpt-oss-20b';
 
 // Modelli di riserva su Groq, in ordine di preferenza. Se quello
 // configurato sparisce, si prova il primo di questi che funziona.
-const GROQ_FALLBACK_MODELS = [
+let GROQ_FALLBACK_MODELS = [
   'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
   'qwen/qwen3.8-27b',
@@ -86,14 +89,85 @@ function isModelNotFoundError(status, message) {
 
 // Restituisce il modello da usare davvero: se quello richiesto è noto
 // come inesistente, ne propone uno alternativo ancora valido.
-function resolveUsableModel(requestedModel) {
-  if (!deadModels.has(requestedModel)) return requestedModel;
-  const alternative = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+// FIX 2026-10-06: nomi vecchi -> nomi attuali. Il frontend (o una copia in cache
+// del browser/PWA) può ancora mandare un nome dismesso da Groq: con questa tabella
+// la richiesta va comunque al modello giusto, invece di fallire e finire sul
+// fallback "lotteria" di OpenRouter (verificato dal vivo: 11-12 s e risultato
+// casuale con il nome vecchio, ~1 s su Groq con il nome nuovo).
+let MODEL_ALIASES = {
+  'qwen/qwen3.6-27b': 'qwen/qwen3.8-27b',
+};
+
+// Modelli Groq in grado di leggere immagini. Se la richiesta contiene una
+// foto, l'auto-riparazione deve scegliere SOLO tra questi: prima poteva
+// ripiegare su gpt-oss (solo testo), che rifiuta le immagini e faceva
+// fallire la richiesta.
+let VISION_MODELS = ['qwen/qwen3.8-27b'];
+
+// ── Configurazione dinamica dei modelli (2026-10-06) ─────────────────────
+// I ruoli (principale, veloce, foto, giudice, multi) vivono in Redis e sono
+// aggiornati dal controllo notturno (api/cron-models.js) SOLO se il modello
+// nuovo supera le prove. Qui li si rilegge ogni 5 minuti. Se Redis non risponde
+// o la config non è valida si usano i valori scritti sopra: mai peggio di prima.
+let _cfgAt = 0;
+async function applyModelConfig(env) {
+  if (Date.now() - _cfgAt < 5 * 60 * 1000) return;
+  _cfgAt = Date.now();
+  try {
+    const { config: c, source } = await loadConfig(env);
+    if (source !== 'redis') return; // nessuna config salvata: restano i valori del codice
+    const r = c.roles;
+    ACTIVE_MAIN = r.main; ACTIVE_FAST = r.fast; JUDGE_MODEL = r.judge;
+    VISION_MODELS = [r.vision];
+    MULTI_MODELS = r.multi.map(id => ({ id, name: prettyName(id) }));
+    GROQ_FALLBACK_MODELS = [...new Set([r.main, r.fast, r.vision, ...r.multi])];
+    MODEL_ALIASES = { ...c.aliases };
+    PROVIDER_CHAIN[0].model = r.main;
+  } catch (e) { console.log('[AI] config modelli non letta, uso i valori del codice: ' + e.message); }
+}
+
+function messagesHaveImage(messages) {
+  return Array.isArray(messages) && messages.some(m =>
+    Array.isArray(m?.content) && m.content.some(part => part && part.type === 'image_url'));
+}
+
+function pickGroqAlternative(messages) {
+  const pool = messagesHaveImage(messages) ? VISION_MODELS : GROQ_FALLBACK_MODELS;
+  return pool.find(m => !deadModels.has(m));
+}
+
+// Restituisce il modello da usare davvero: se quello richiesto è noto
+// come inesistente, ne propone uno alternativo ancora valido.
+function resolveUsableModel(requestedModel, messages) {
+  const wanted = MODEL_ALIASES[requestedModel] || requestedModel;
+  if (!deadModels.has(wanted)) return wanted;
+  const alternative = pickGroqAlternative(messages);
   if (alternative) {
-    console.log('[AI] auto-riparazione: "' + requestedModel + '" non disponibile, uso "' + alternative + '"');
+    console.log('[AI] auto-riparazione: "' + wanted + '" non disponibile, uso "' + alternative + '"');
     return alternative;
   }
-  return requestedModel; // nessuna alternativa nota: riprova comunque
+  return wanted; // nessuna alternativa nota: riprova comunque
+}
+
+// FIX 2026-10-06: la modalità multi-modello (Fast/Best) NON faceva mai la ricerca
+// web: domande su meteo, notizie, prezzi ricevevano "non dispongo di dati in tempo
+// reale" (la chat normale invece cercava). Queste due funzioni rendono la stessa
+// logica riusabile anche nel ramo multi-modello.
+async function buildWebContext(userText, tavilyKey) {
+  try {
+    const q = userText.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
+    const r = await tavilySearch(q, tavilyKey);
+    if (!r) return '';
+    const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
+    return '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni. Cita le fonti.';
+  } catch (e) { console.error('Tavily (multi):', e.message); return ''; }
+}
+function injectWebContext(messages, webCtx) {
+  const out = [...messages];
+  const si = out.findIndex(m => m.role === 'system');
+  if (si !== -1) out[si] = { ...out[si], content: out[si].content + webCtx };
+  else out.unshift({ role: 'system', content: webCtx });
+  return out;
 }
 
 const WEB_TRIGGERS = [
@@ -277,8 +351,8 @@ function selectBestModel(text, defaultModel) {
   // su MULTI_MODELS per i dettagli. Questo bug faceva sì che OGNI richiesta
   // di codice fallisse su Groq (modello inesistente) e cadesse sempre sul
   // fallback OpenRouter, più lento — invisibile all'utente ma reale.
-  if (/\b(scrivi|analizza|spiega.*dettagl|codice|programm|funzione|algoritmo|essay|articolo|relazione|riassunto lungo)\b/i.test(text)) return 'openai/gpt-oss-120b';
-  if (/\b(perché|ragiona|confronta|differenza|vantaggio|svantaggio|pro.*contro|calcola|dimostra|argomenta)\b/i.test(text)) return 'openai/gpt-oss-20b';
+  if (/\b(scrivi|analizza|spiega.*dettagl|codice|programm|funzione|algoritmo|essay|articolo|relazione|riassunto lungo)\b/i.test(text)) return ACTIVE_MAIN;
+  if (/\b(perché|ragiona|confronta|differenza|vantaggio|svantaggio|pro.*contro|calcola|dimostra|argomenta)\b/i.test(text)) return ACTIVE_FAST;
   return defaultModel;
 }
 
@@ -416,7 +490,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
     // SOLO al provider principale (il primo, Groq); i provider di
     // riserva usano sempre il proprio nome modello corretto.
     const requestedModel = i === 0 ? (model || p.model) : p.model;
-    const useModel = i === 0 ? resolveUsableModel(requestedModel) : requestedModel;
+    const useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
     try {
       const res = await fetch(p.url, {
         method: 'POST',
@@ -445,7 +519,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
         if (i === 0 && isModelNotFoundError(res.status, readableMsg)) {
           console.log('[AI] ⚠️ MODELLO NON DISPONIBILE: "' + useModel + '" — ' + readableMsg);
           deadModels.add(useModel);
-          const retryModel = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+          const retryModel = pickGroqAlternative(messages);
           if (retryModel) {
             console.log('[AI] auto-riparazione: ritento con "' + retryModel + '"');
             const retryRes = await fetch(p.url, {
@@ -511,7 +585,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     const requestedModel = i === 0 ? (model || p.model) : p.model;
-    let useModel = i === 0 ? resolveUsableModel(requestedModel) : requestedModel;
+    let useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
     try {
       let res = await fetch(p.url, {
         method: 'POST',
@@ -533,7 +607,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
         if (i === 0 && isModelNotFoundError(res.status, readableMsg)) {
           console.log('[AI] ⚠️ MODELLO NON DISPONIBILE (stream): "' + useModel + '" — ' + readableMsg);
           deadModels.add(useModel);
-          const retryModel = GROQ_FALLBACK_MODELS.find(m => !deadModels.has(m));
+          const retryModel = pickGroqAlternative(messages);
           if (retryModel) {
             console.log('[AI] auto-riparazione (stream): ritento con "' + retryModel + '"');
             const retryRes = await fetch(p.url, {
@@ -670,7 +744,8 @@ export default async function handler(req) {
   catch(e) { return new Response(JSON.stringify({ error: 'Invalid body' }), { status: 400, headers: { ...cors, 'Content-Type': 'application/json' } }); }
 
   const messages    = body.messages || [];
-  const model       = body.model || 'openai/gpt-oss-120b';
+  await applyModelConfig(process.env);
+  const model       = MODEL_ALIASES[body.model] || body.model || ACTIVE_MAIN;
   // ── NUOVO: forceWeb e multiMode sono feature Premium. Anche se il client
   // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
   const forceWeb    = isPremiumServer && body.webSearch === true;
@@ -769,13 +844,20 @@ export default async function handler(req) {
   // ══════════════════════════════════════════════════════════════════════
   if (multiMode) {
     const disclaimedMessages = applySensitiveDisclaimer(messages, userText);
+    const multiNeedsWeb = !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
     const readable = makeSSE(async (send) => {
-      send({ type: 'meta', webSearchUsed: false });
+      let multiMessages = disclaimedMessages;
+      let multiWebCtx = '';
+      if (multiNeedsWeb) {
+        multiWebCtx = await buildWebContext(userText, tavilyKey);
+        if (multiWebCtx) multiMessages = injectWebContext(disclaimedMessages, multiWebCtx);
+      }
+      send({ type: 'meta', webSearchUsed: !!multiWebCtx });
 
       if (multiMode === 'fast') {
         send({ type: 'multi_start', models: MULTI_MODELS.map(m => m.name) });
         const race = MULTI_MODELS.map(m =>
-          callWithFallback([{ ...providers[0], model: m.id }], disclaimedMessages, maxTokens, temperature, m.id)
+          callWithFallback([{ ...providers[0], model: m.id }], multiMessages, maxTokens, temperature, m.id)
             .then(r => r && r.text ? { model: m, text: r.text } : Promise.reject())
             .catch(() => null)
         );
@@ -807,7 +889,7 @@ export default async function handler(req) {
         // come il resto del codice.
         const results = await Promise.allSettled(
           MULTI_MODELS.map(m =>
-            callWithFallback([{ ...providers[0], model: m.id }, ...providers.slice(1)], disclaimedMessages, Math.min(maxTokens, 768), temperature, m.id)
+            callWithFallback([{ ...providers[0], model: m.id }, ...providers.slice(1)], multiMessages, Math.min(maxTokens, 768), temperature, m.id)
               .then(r => ({ model: m.name, text: r.text }))
           )
         );
@@ -825,7 +907,7 @@ export default async function handler(req) {
 
         const judgePrompt = 'Domanda: "' + userText + '"\n\n' +
           valid.map((v,i) => 'Risposta ' + (i+1) + ' (' + v.model + '):\n' + v.text).join('\n\n---\n\n') +
-          '\n\nSintetizza la risposta migliore in italiano, completa e precisa, senza citare i modelli.';
+          '\n\nSintetizza la risposta migliore in italiano, completa e precisa, senza citare i modelli.' + (multiWebCtx ? '\n\nPer i fatti aggiornati usa SOLO questi risultati web e citane le fonti:' + multiWebCtx : '');
 
         send({ type: 'multi_judging' });
         const judgeSystemPrompt = 'Sintetizza risposte AI in italiano, preciso e completo.' + (needsSensitiveDisclaimer(userText) ? SENSITIVE_DISCLAIMER_INSTRUCTION : '');
@@ -844,7 +926,9 @@ export default async function handler(req) {
           maxTokens, 0.3, JUDGE_MODEL
         );
         const synthesis = judgeResult.text;
-        setCache(getCacheKey(messages, smartModel), synthesis);
+        // FIX 2026-10-06: niente cache per domande che dipendono dal tempo (meteo, notizie,
+        // prezzi): una risposta sbagliata veniva riproposta identica per un'ora.
+        if (!multiNeedsWeb) setCache(getCacheKey(messages, smartModel), synthesis);
         send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
         for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i+4) });
         send({ type: 'done' });
@@ -1031,8 +1115,8 @@ export default async function handler(req) {
   // BRANCH: STREAMING NORMALE
   // ══════════════════════════════════════════════════════════════════════
 
-  // Cache check
-  if (!forceWeb) {
+  // Cache check (mai per domande che richiedono dati aggiornati)
+  if (!forceWeb && !WEB_TRIGGERS.some(re => re.test(userText))) {
     const cacheKey = getCacheKey(messages, smartModel);
     const cached = getCached(cacheKey);
     if (cached) {
