@@ -960,7 +960,19 @@ export default async function handler(req) {
         const valid = results.filter(r => r.status === 'fulfilled' && r.value?.text).map(r => r.value);
         console.log('[AI] Best-of-N: ' + valid.length + '/' + MULTI_MODELS.length + ' responded');
 
-        if (valid.length === 0) { send({ type: 'error', message: 'Nessun modello ha risposto' }); return; }
+        if (valid.length === 0) {
+          // 2026-10-09: ultimo tentativo con UNA sola chiamata (contesto web accorciato) prima di arrendersi
+          try {
+            const slim = multiWebCtx ? injectWebContext(disclaimedMessages, multiWebCtx.slice(0, 3500)) : disclaimedMessages;
+            const lastTry = await callWithFallback(providers, slim, Math.min(maxTokens, 1200), temperature, ACTIVE_MAIN);
+            if (lastTry && lastTry.text) {
+              send({ type: 'multi_winner', model: lastTry.model || 'GPT-OSS 120B' });
+              for (let i = 0; i < lastTry.text.length; i += 4) send({ type: 'token', token: lastTry.text.slice(i, i+4) });
+              send({ type: 'done' }); return;
+            }
+          } catch (e) { console.log('[AI] ultimo tentativo fallito: ' + e.message); }
+          send({ type: 'error', message: 'Nessun modello ha risposto' }); return;
+        }
         if (valid.length === 1) {
           send({ type: 'multi_winner', model: valid[0].model });
           for (let i = 0; i < valid[0].text.length; i += 4) send({ type: 'token', token: valid[0].text.slice(i, i+4) });
@@ -977,8 +989,8 @@ export default async function handler(req) {
         send({ type: 'multi_responses', responses: valid.map(v => ({ model: v.model, preview: v.text.slice(0, 150) + '...' })) });
 
         const judgePrompt = 'Domanda: "' + userText + '"\n\n' +
-          valid.map((v,i) => 'Risposta ' + (i+1) + ' (' + v.model + '):\n' + v.text).join('\n\n---\n\n') +
-          '\n\nSintetizza la risposta migliore in italiano, completa e precisa, senza citare i modelli.' + (multiWebCtx ? '\n\nPer i fatti aggiornati usa SOLO questi risultati web e citane le fonti:' + multiWebCtx : '');
+          valid.map((v,i) => 'Risposta ' + (i+1) + ' (' + v.model + '):\n' + v.text.slice(0, 2500)).join('\n\n---\n\n') +
+          '\n\nSintetizza la risposta migliore in italiano, completa e precisa, senza citare i modelli.' + (multiWebCtx ? '\n\nPer i fatti aggiornati usa SOLO questi risultati web e citane le fonti:' + multiWebCtx.slice(0, 6000) : '');
 
         send({ type: 'multi_judging' });
         const judgeSystemPrompt = 'Sintetizza risposte AI in italiano, preciso e completo.' + (needsSensitiveDisclaimer(userText) ? SENSITIVE_DISCLAIMER_INSTRUCTION : '');
@@ -991,12 +1003,30 @@ export default async function handler(req) {
         // SOLO Groq senza riserva OpenRouter — andava in errore 413 "Request
         // too large" e l'utente vedeva comunque "Errore del server (500)"
         // nonostante le 3 risposte individuali fossero già arrivate.
-        const judgeResult = await callWithFallback(
-          [{ ...providers[0], model: JUDGE_MODEL }, ...providers.slice(1)],
-          [{ role: 'system', content: judgeSystemPrompt }, { role: 'user', content: judgePrompt }],
-          maxTokens, 0.3, JUDGE_MODEL
-        );
-        const synthesis = judgeResult.text;
+        // 2026-10-09: "mai Error 500" anche nel passo giudice. Se la sintesi fallisce (limite token
+        // al minuto, provider giu'), si usa la migliore delle risposte gia' arrivate invece di
+        // mostrare un errore: l'utente riceve comunque una risposta.
+        // Causa vista nei log (2026-10-09 22:43): le 3 chiamate in parallelo esauriscono il limite di
+        // token/minuto di Groq ("Groq rate limited"), poi OpenRouter risponde vuoto -> errore 500.
+        // Rimedio: una pausa breve e un secondo tentativo, poi la migliore risposta gia' arrivata.
+        let synthesis;
+        for (let attempt = 1; attempt <= 2 && !synthesis; attempt++) {
+          try {
+            if (attempt === 2) await new Promise(r => setTimeout(r, 3000));
+            const judgeResult = await callWithFallback(
+              [{ ...providers[0], model: JUDGE_MODEL }, ...providers.slice(1)],
+              [{ role: 'system', content: judgeSystemPrompt }, { role: 'user', content: judgePrompt }],
+              maxTokens, 0.3, JUDGE_MODEL
+            );
+            synthesis = judgeResult.text;
+          } catch (judgeErr) {
+            console.log('[AI] giudice fallito (tentativo ' + attempt + '): ' + judgeErr.message);
+          }
+        }
+        if (!synthesis) {
+          console.log('[AI] giudice non disponibile -> uso la migliore risposta singola');
+          synthesis = [...valid].sort((a, b) => b.text.length - a.text.length)[0].text;
+        }
         // FIX 2026-10-06: niente cache per domande che dipendono dal tempo (meteo, notizie,
         // prezzi): una risposta sbagliata veniva riproposta identica per un'ora.
         if (!multiNeedsWeb && !multiWebCtx) setCache(getCacheKey(messages, smartModel), synthesis);
