@@ -695,6 +695,64 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════
+// RILEVAMENTO SEMANTICO "SERVONO DATI AGGIORNATI?" (aggiunto 2026-10-09)
+// Perché: WEB_TRIGGERS (parole chiave) non copre tutto — "prossimo turno di
+// Serie A", "come sta andando il Napoli?", "terremoto stanotte" non
+// contengono nessuna parola chiave, e i modelli rispondevano a memoria
+// inventando partite. Ora, se nessuna parola chiave scatta, un modello
+// veloce decide in base al SENSO della domanda. La chiamata e' interna: non
+// consuma messaggi Free dell'utente (il limite e' contato all'ingresso).
+// Se il classificatore fallisce o va in timeout -> false (si resta sulle regole
+// a parole chiave: mai peggio di prima).
+// ══════════════════════════════════════════════════════════════════════
+const FRESH_CLASSIFIER_PROMPT = 'Decidi se per rispondere correttamente alla domanda dell\'utente servono dati aggiornati o che cambiano nel tempo: partite, calendari, risultati, classifiche, prezzi, quotazioni, azioni, criptovalute, meteo, notizie, eventi recenti o in corso (terremoti, incidenti, elezioni, guerre), uscite di prodotti, cariche o ruoli attuali di persone, orari, disponibilita\'. Rispondi con UNA sola parola: WEB se servono dati aggiornati, NESSUNA se basta la conoscenza generale (spiegazioni, storia, concetti, scrittura creativa, codice, matematica, consigli, chiacchiere). Nessun altro testo.';
+const freshClassCache = new Map();
+async function classifyNeedsFreshData(userText, providers) {
+  const t = (userText || '').replace(/---[\s\S]*?---/g, '').trim();
+  if (t.length < 8 || t.length > 400) return false;
+  const key = t.toLowerCase();
+  if (freshClassCache.has(key)) return freshClassCache.get(key);
+  let res = false;
+  try {
+    const r = await Promise.race([
+      callWithFallback(
+        [{ ...providers[0], model: ACTIVE_FAST }, ...providers.slice(1)],
+        [{ role: 'system', content: FRESH_CLASSIFIER_PROMPT }, { role: 'user', content: t }],
+        400, 0, ACTIVE_FAST
+      ),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4500)),
+    ]);
+    res = /\bWEB\b/i.test(String(r.text || '').trim().slice(0, 60));
+    console.log('[AI] classificatore dati aggiornati: ' + (res ? 'WEB' : 'NESSUNA') + ' <- "' + t.slice(0, 60) + '"');
+  } catch (e) {
+    console.log('[AI] classificatore dati aggiornati non disponibile: ' + e.message);
+    return false;
+  }
+  if (freshClassCache.size > 500) freshClassCache.clear();
+  freshClassCache.set(key, res);
+  return res;
+}
+
+// Seconda rete di sicurezza per Best-of-N: se i modelli ammettono di non avere dati
+// aggiornati, oppure sui numeri (punteggi, prezzi, date) sono in netto disaccordo,
+// il dato quasi certamente e' "in tempo reale": si cerca sul web prima della sintesi.
+const UNCERTAIN_RE = /(non dispongo|non ho accesso|dati in tempo reale|informazioni (aggiornate|in tempo reale)|non posso (confermare|verificare)|non sono in grado di (fornire|verificare|confermare)|fino alla mia data|knowledge cutoff|ultimo aggiornamento (delle|dei) mi)/i;
+function answersNeedWeb(valid) {
+  if (valid.some(v => UNCERTAIN_RE.test(v.text))) return true;
+  const sets = valid.map(v => new Set((v.text.match(/\d[\d.,]*\d/g) || [])));
+  const withNums = sets.filter(st => st.size >= 2);
+  if (withNums.length < 2) return false;
+  for (let i = 0; i < withNums.length; i++) {
+    for (let j = i + 1; j < withNums.length; j++) {
+      const inter = [...withNums[i]].filter(x => withNums[j].has(x)).length;
+      const uni = new Set([...withNums[i], ...withNums[j]]).size;
+      if (uni > 0 && inter / uni < 0.25) return true;
+    }
+  }
+  return false;
+}
+
 export default async function handler(req) {
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
   if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: cors });
@@ -748,7 +806,7 @@ export default async function handler(req) {
   const model       = MODEL_ALIASES[body.model] || body.model || ACTIVE_MAIN;
   // ── NUOVO: forceWeb e multiMode sono feature Premium. Anche se il client
   // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
-  const forceWeb    = isPremiumServer && body.webSearch === true;
+  const forceWeb    = body.webSearch === true;   // 2026-10-09: ricerca web disponibile anche in modalita' Free
   const agentMode   = body.agentMode === true;
   const multiMode   = isPremiumServer ? (body.multiMode || null) : null;
   const temperature = body.temperature != null ? body.temperature : 0.7;
@@ -765,6 +823,12 @@ export default async function handler(req) {
   const userText   = getLastUserText(messages);
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
+
+  // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
+  let needsWeb = !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
+  if (!needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
+    needsWeb = await classifyNeedsFreshData(userText, providers);
+  }
 
   // ── FIX 2026-09-19: data E ORA reali sempre note al modello, in TUTTE
   // le modalità ─────────────────────────────────────────────────────────
@@ -844,7 +908,7 @@ export default async function handler(req) {
   // ══════════════════════════════════════════════════════════════════════
   if (multiMode) {
     const disclaimedMessages = applySensitiveDisclaimer(messages, userText);
-    const multiNeedsWeb = !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
+    const multiNeedsWeb = needsWeb;
     const readable = makeSSE(async (send) => {
       let multiMessages = disclaimedMessages;
       let multiWebCtx = '';
@@ -903,6 +967,13 @@ export default async function handler(req) {
           send({ type: 'done' }); return;
         }
 
+        // 2026-10-09: modelli che ammettono di non avere dati, o in disaccordo sui numeri -> cerca sul web
+        if (!multiWebCtx && tavilyKey && answersNeedWeb(valid)) {
+          console.log('[AI] Best-of-N: incertezza/disaccordo tra i modelli -> ricerca web prima della sintesi');
+          const lateCtx = await buildWebContext(userText, tavilyKey);
+          if (lateCtx) { multiWebCtx = lateCtx; send({ type: 'meta', webSearchUsed: true }); }
+        }
+
         send({ type: 'multi_responses', responses: valid.map(v => ({ model: v.model, preview: v.text.slice(0, 150) + '...' })) });
 
         const judgePrompt = 'Domanda: "' + userText + '"\n\n' +
@@ -928,7 +999,7 @@ export default async function handler(req) {
         const synthesis = judgeResult.text;
         // FIX 2026-10-06: niente cache per domande che dipendono dal tempo (meteo, notizie,
         // prezzi): una risposta sbagliata veniva riproposta identica per un'ora.
-        if (!multiNeedsWeb) setCache(getCacheKey(messages, smartModel), synthesis);
+        if (!multiNeedsWeb && !multiWebCtx) setCache(getCacheKey(messages, smartModel), synthesis);
         send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
         for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i+4) });
         send({ type: 'done' });
@@ -965,7 +1036,7 @@ export default async function handler(req) {
       // deterministico già usato con successo in chat normale (WEB_TRIGGERS,
       // vedi 'shouldSearch' più sotto) — qui forziamo il primo passo invece
       // di lasciare la decisione al giudizio del modello.
-      if (tavilyKey && WEB_TRIGGERS.some(re => re.test(userText))) {
+      if (needsWeb) {
         send({ type: 'agent_thought', thought: 'Domanda su informazioni in tempo reale: eseguo prima una ricerca web.', step: 1 });
         send({ type: 'agent_tools', tools: ['web_search'] });
         usedWeb = true;
@@ -1116,7 +1187,7 @@ export default async function handler(req) {
   // ══════════════════════════════════════════════════════════════════════
 
   // Cache check (mai per domande che richiedono dati aggiornati)
-  if (!forceWeb && !WEB_TRIGGERS.some(re => re.test(userText))) {
+  if (!needsWeb) {
     const cacheKey = getCacheKey(messages, smartModel);
     const cached = getCached(cacheKey);
     if (cached) {
@@ -1132,7 +1203,7 @@ export default async function handler(req) {
 
   // Web search
   let webCtx = '';
-  const shouldSearch = tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
+  const shouldSearch = needsWeb;
   if (shouldSearch) {
     try {
       const q = userText.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
