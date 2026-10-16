@@ -856,6 +856,9 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
       if (p === providers[providers.length - 1]) throw e;
     }
   }
+  // FIX 2026-10-16: se TUTTI i provider rispondono 429/503 il ciclo finiva in silenzio e al client arrivava una risposta vuota
+  // (solo "meta"). Ora l'errore sale e makeSSE manda un evento 'error' leggibile.
+  throw new Error('Tutti i provider gratuiti sono al limite (429/503): riprova tra un minuto.');
 }
 
 // ════════════════════════════════════════════════════════════════════════
