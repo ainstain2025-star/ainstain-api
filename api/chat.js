@@ -586,6 +586,55 @@ function looksLikeInvalidCompletion(text) {
   return false;
 }
 
+// ── LIMITE TOKEN AL MINUTO DI GROQ (piano gratuito: 8000, conta input + max_tokens) ──
+// FIX 2026-10-16: con un documento lungo allegato (PDF da 42 pagine, ~27.000 token) ogni richiesta
+// veniva rifiutata da Groq (errore 413), poi la riserva gratuita rispondeva vuota e l'utente
+// aspettava minuti. Ora la richiesta viene SEMPRE ridotta per stare nel limite: prima si abbassa
+// max_tokens (minimo 1200), poi si accorciano i messaggi più lunghi (tenendo inizio e fine) e,
+// solo se serve, i più vecchi. L'ultima domanda dell'utente viene accorciata per ultima.
+const GROQ_TPM_BUDGET = 7400;
+function approxTokens(messages) {
+  let n = 0;
+  for (const m of messages) {
+    if (typeof m.content === 'string') n += m.content.length;
+    else if (Array.isArray(m.content)) for (const part of m.content) { if (part && part.type === 'text' && part.text) n += part.text.length; else n += 1500; }
+  }
+  return Math.ceil(n / 3);
+}
+function cutMiddle(text, maxChars) {
+  if (text.length <= maxChars) return text;
+  const head = Math.floor(maxChars * 0.6), tail = maxChars - head;
+  return text.slice(0, head) + '\n[…parte centrale omessa per limiti di lunghezza…]\n' + text.slice(text.length - tail);
+}
+function fitForGroq(messages, maxTokens) {
+  const before = approxTokens(messages);
+  if (before + maxTokens <= GROQ_TPM_BUDGET) return { messages, maxTokens };
+  let maxT = Math.max(Math.min(1200, maxTokens), Math.min(maxTokens, GROQ_TPM_BUDGET - before));
+  const targetChars = (GROQ_TPM_BUDGET - maxT) * 3;
+  const out = messages.map(m => ({ ...m }));
+  const total = () => out.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : 0), 0);
+  const lastUserIdx = (() => { for (let i = out.length - 1; i >= 0; i--) if (out[i].role === 'user') return i; return -1; })();
+  let guard = 0;
+  while (total() > targetChars && guard++ < 60) {
+    // il messaggio di testo più lungo che non sia l'ultima domanda
+    let idx = -1, len = 0;
+    out.forEach((m, i) => { if (i !== lastUserIdx && typeof m.content === 'string' && m.content.length > len) { len = m.content.length; idx = i; } });
+    if (idx >= 0 && len > 1800) { out[idx].content = cutMiddle(out[idx].content, Math.max(1500, Math.floor(len / 2))); continue; }
+    // niente più da accorciare tra i vecchi: ultima domanda (tiene inizio e fine)
+    if (lastUserIdx >= 0 && typeof out[lastUserIdx].content === 'string' && out[lastUserIdx].content.length > 2500) {
+      const over = total() - targetChars;
+      out[lastUserIdx].content = cutMiddle(out[lastUserIdx].content, Math.max(2500, out[lastUserIdx].content.length - over - 200));
+      if (total() <= targetChars) break;
+    }
+    // ultima risorsa: scarta il messaggio più vecchio non di sistema
+    const drop = out.findIndex((m, i) => m.role !== 'system' && i !== lastUserIdx);
+    if (drop < 0) break;
+    out.splice(drop, 1);
+  }
+  console.log('[AI] Groq: richiesta ridotta da ~' + before + ' a ~' + approxTokens(out) + ' token (max_tokens ' + maxTokens + ' -> ' + maxT + ')');
+  return { messages: out, maxTokens: maxT };
+}
+
 // ── Chiamata non-streaming con fallback ───────────────────────────────
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
   for (let i = 0; i < providers.length; i++) {
@@ -600,13 +649,15 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
     // Ora l'override personalizzato (es. da selectBestModel) si applica
     // SOLO al provider principale (il primo, Groq); i provider di
     // riserva usano sempre il proprio nome modello corretto.
+    const fit = i === 0 ? fitForGroq(messages, maxTokens) : { messages, maxTokens };
     const requestedModel = i === 0 ? (model || p.model) : p.model;
     const useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
     try {
       const res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: false }),
+        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false }),
+        signal: AbortSignal.timeout(25000),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
       if (!res.ok) {
@@ -636,7 +687,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
             const retryRes = await fetch(p.url, {
               method: 'POST',
               headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-              body: JSON.stringify({ model: retryModel, messages, max_tokens: maxTokens, temperature, stream: false }),
+              body: JSON.stringify({ model: retryModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false }),
             });
             if (retryRes.ok) {
               const retryData = await retryRes.json();
@@ -667,7 +718,8 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
             const retryRes2 = await fetch(p.url, {
               method: 'POST',
               headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-              body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: false }),
+              body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false }),
+        signal: AbortSignal.timeout(25000),
             });
             if (retryRes2.ok) {
               const retryData2 = await retryRes2.json();
@@ -695,13 +747,14 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
+    const fit = i === 0 ? fitForGroq(messages, maxTokens) : { messages, maxTokens };
     const requestedModel = i === 0 ? (model || p.model) : p.model;
     let useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
     try {
       let res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: useModel, messages, max_tokens: maxTokens, temperature, stream: true }),
+        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true }),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
       if (!res.ok) {
@@ -724,7 +777,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
             const retryRes = await fetch(p.url, {
               method: 'POST',
               headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-              body: JSON.stringify({ model: retryModel, messages, max_tokens: maxTokens, temperature, stream: true }),
+              body: JSON.stringify({ model: retryModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true }),
             });
             if (retryRes.ok) {
               res = retryRes;
