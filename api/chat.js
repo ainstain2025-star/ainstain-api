@@ -1092,13 +1092,22 @@ export default async function handler(req) {
 
   const providers  = getProviders(process.env);
   const userText   = getLastUserText(messages);
+  // 2026-10-16: modalità "solo dal documento": noWeb=true -> nessuna ricerca web in nessun ramo (parole chiave, giudizio
+  // semantico, multi-modello, agente). webQuery = la domanda pulita dell'utente: serve come testo di ricerca quando il
+  // messaggio contiene gli estratti del documento (altrimenti la ricerca partirebbe dall'intestazione degli estratti).
+  const noWeb      = body.noWeb === true;
+  const webQuery   = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery.trim().slice(0, 300) : '';
+  const searchText = webQuery || userText;
+  // 2026-10-16: con un documento allegato il messaggio inizia con l'intestazione degli estratti, identica per ogni domanda:
+  // la cache (chiave = primi 200 caratteri) avrebbe restituito la risposta della prima domanda a tutte le successive.
+  const cacheable  = !noWeb && !/^\s*\[(?:DOCUMENTO|MODALIT)/.test(String(userText));
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
-  let needsWeb = !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(userText)));
-  if (!needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
-    needsWeb = await classifyNeedsFreshData(userText, providers);
+  let needsWeb = !noWeb && !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(searchText)));
+  if (!noWeb && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
+    needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
 
   // ── FIX 2026-09-19: data E ORA reali sempre note al modello, in TUTTE
@@ -1185,7 +1194,7 @@ export default async function handler(req) {
       let multiMessages = disclaimedMessages;
       let multiWebCtx = '';
       if (multiNeedsWeb) {
-        multiWebCtx = await buildWebContext(userText, tavilyKey);
+        multiWebCtx = await buildWebContext(searchText, tavilyKey);
         if (multiWebCtx) multiMessages = injectWebContext(disclaimedMessages, multiWebCtx);
       }
       send({ type: 'meta', webSearchUsed: !!multiWebCtx });
@@ -1252,9 +1261,9 @@ export default async function handler(req) {
         }
 
         // 2026-10-09: modelli che ammettono di non avere dati, o in disaccordo sui numeri -> cerca sul web
-        if (!multiWebCtx && tavilyKey && answersNeedWeb(valid)) {
+        if (!noWeb && !multiWebCtx && tavilyKey && answersNeedWeb(valid)) {
           console.log('[AI] Best-of-N: incertezza/disaccordo tra i modelli -> ricerca web prima della sintesi');
-          const lateCtx = await buildWebContext(userText, tavilyKey);
+          const lateCtx = await buildWebContext(searchText, tavilyKey);
           if (lateCtx) { multiWebCtx = lateCtx; send({ type: 'meta', webSearchUsed: true }); }
         }
 
@@ -1301,7 +1310,7 @@ export default async function handler(req) {
         }
         // FIX 2026-10-06: niente cache per domande che dipendono dal tempo (meteo, notizie,
         // prezzi): una risposta sbagliata veniva riproposta identica per un'ora.
-        if (!multiNeedsWeb && !multiWebCtx) setCache(getCacheKey(messages, smartModel), synthesis);
+        if (cacheable && !multiNeedsWeb && !multiWebCtx) setCache(getCacheKey(messages, smartModel), synthesis);
         send({ type: 'multi_winner', model: 'Sintesi Multi-AI' });
         for (let i = 0; i < synthesis.length; i += 4) send({ type: 'token', token: synthesis.slice(i, i+4) });
         send({ type: 'done' });
@@ -1343,7 +1352,7 @@ export default async function handler(req) {
         send({ type: 'agent_thought', thought: 'Domanda su informazioni in tempo reale: eseguo prima una ricerca web.', step: 1 });
         send({ type: 'agent_tools', tools: ['web_search'] });
         usedWeb = true;
-        const forcedObservation = await executeReActTool('web_search', userText, { tavilyKey });
+        const forcedObservation = await executeReActTool('web_search', searchText, { tavilyKey: noWeb ? '' : tavilyKey });
         send({ type: 'agent_observation', tool: 'web_search', observation: String(forcedObservation).slice(0, 300) });
         reactMessages.push({ role: 'assistant', content: 'THOUGHT: La domanda riguarda informazioni in tempo reale, cerco prima sul web.\nACTION: web_search\nACTION_INPUT: ' + userText });
         reactMessages.push({
@@ -1488,7 +1497,7 @@ export default async function handler(req) {
           if (parsed.action === 'remember') send({ type: 'agent_saved', note: parsed.actionInput });
           if (parsed.action === 'web_search' || parsed.action === 'read_url') usedWeb = true;
 
-          const observation = await executeReActTool(parsed.action, parsed.actionInput, { tavilyKey });
+          const observation = await executeReActTool(parsed.action, parsed.actionInput, { tavilyKey: noWeb ? '' : tavilyKey });
           send({ type: 'agent_observation', tool: parsed.action, observation: String(observation).slice(0, 300) });
 
           // Guardia anti-loop: se l'azione è identica alla precedente, avvisa
@@ -1549,7 +1558,7 @@ export default async function handler(req) {
   // ══════════════════════════════════════════════════════════════════════
 
   // Cache check (mai per domande che richiedono dati aggiornati)
-  if (!needsWeb) {
+  if (!needsWeb && cacheable) {
     const cacheKey = getCacheKey(messages, smartModel);
     const cached = getCached(cacheKey);
     if (cached) {
@@ -1568,7 +1577,7 @@ export default async function handler(req) {
   const shouldSearch = needsWeb;
   if (shouldSearch) {
     try {
-      const q = userText.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
+      const q = searchText.replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
       const r = await tavilySearch(q, tavilyKey);
       if (r) {
         const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
