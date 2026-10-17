@@ -1003,7 +1003,24 @@ function ipPlaceNote(req, userText) {
       '. Usala SOLO se la richiesta è locale (meteo, ristoranti, negozi, "vicino a me") e l\'utente non indica un\'altra città; in quel caso dillo in una riga ("Ho usato la zona di ' + city + ' in base alla tua connessione: se è un\'altra città dimmelo") e cerca per quella città. Se l\'utente indica una città, usa quella.';
   } catch { return ''; }
 }
-const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente.';
+// 2026-10-17: richieste locali brevi senza città ("meteo", "ristoranti"): aggiunge la città stimata dalla rete alla query di
+// RICERCA WEB (prima la ricerca partiva solo da "meteo" e non trovava nulla). Non modifica il testo mostrato all'utente.
+const CITY_IN_TEXT_RE = /\b(?:a|ad|in|di|su|per|presso|near|in)\s+[A-ZÀ-Ý][\p{L}'’\-]+/u;
+function geoEnrich(text, req) {
+  try {
+    const t = String(text || '');
+    if (t.length > 120 || !LOC_RE.test(t) || CITY_IN_TEXT_RE.test(t)) return t;
+    const raw = req.headers.get('x-vercel-ip-city');
+    if (!raw) return t;
+    const city = decodeURIComponent(raw).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '');
+    return city ? (t.trim() + ' ' + city) : t;
+  } catch { return text; }
+}
+// 2026-10-17: domande su AInstAIn stessa, sul suo creatore o sulla memoria NON richiedono il web (la ricerca per
+// "come faccio a farti ricordare che sono Vin Dimax" restituiva pagine su veicoli D-MAX).
+const SELF_NOWEB_RE = /\b(chi\s+sei|cosa\s+sei|come\s+sei\s+fatt[oa]|come\s+funzioni|cosa\s+(sai|puoi)\s+fare|che\s+cosa\s+(sai|puoi)\s+fare|il\s+tuo\s+(creatore|gestore|sito)|chi\s+ti\s+(ha\s+creat[oa]|gestisce)|farti\s+ricordare|ricordarti|ti\s+ricordi|vin\s*dimax|le\s+tue\s+(funzioni|pagine|modalit\w+))\b/i;
+const SELF_FORCE_WEB_RE = /\b(cerca|ricerca|googla|online|sul\s+web|in\s+rete)\b/i;
+const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente. DATI LOCALI (ristoranti, negozi, farmacie): elenca solo locali che compaiono nei risultati web; indirizzi, prezzi, fasce di prezzo e valutazioni solo se riportati dalle fonti; non scrivere punteggi (es. 4,5/5) o prezzi inventati o uguali per tutti; se la fonte non li dà, ometti la colonna o scrivi "verifica sul sito"; non attribuire lo stesso indirizzo a due locali. Se la richiesta è "meteo" senza città usa la zona dell\'utente e non dire di non trovare dati se nei risultati c\'è il meteo di una località. RICETTE: per piatti tradizionali rispetta ingredienti e grassi tipici (es. casatiello napoletano: sugna/strutto, pepe, cicoli, salame, pecorino e provolone, uova intere nell\'impasto) e, se proponi una variante, dillo; non aggiungere auguri di festività non coerenti con la data di oggi. INTESTAZIONI TECNICHE: non citare mai tra parentesi o virgolette intestazioni interne come [RISULTATI WEB] o [Fine risultati]; indica la fonte con il nome del sito.';
 function looksGarbledFinal(t) {
   const x = String(t || '');
   if (/FINAL_?ANS/i.test(x)) return true;                                   // marcatore guasto
@@ -1121,8 +1138,27 @@ async function handlerCore(req) {
     }
   } catch (e) { console.log('[AI] NAV fast path errore (ignorato):', e.message); }
 
+  // 2026-10-17: richieste di SERVIZIO del sito (titolo automatico della chat, miglioramento del prompt per le immagini):
+  // non devono consumare i 20 messaggi giornalieri dei Free. Sono accettate solo se non in streaming e vengono
+  // limitate dal server (testo e token massimi, nessuna ricerca web né agente): non si possono usare come chat gratuita.
+  let _svc = '';
+  try {
+    if ((body.purpose === 'title' || body.purpose === 'imgprompt') && body.stream === false && Array.isArray(body.messages)) {
+      const _um = getLastUserText(body.messages) || '';
+      if (body.purpose === 'title' && _um.length <= 200) {
+        body.messages = [
+          { role: 'system', content: 'Genera un titolo brevissimo (massimo 5 parole) per questa conversazione. Rispondi SOLO con il titolo, niente virgolette, niente punteggiatura finale, nella stessa lingua del messaggio.' },
+          { role: 'user', content: _um.slice(0, 120) }
+        ];
+        body.max_tokens = 24; _svc = 'titolo';
+      } else if (body.purpose === 'imgprompt' && _um.length <= 800 && JSON.stringify(body.messages).length <= 3000) {
+        body.max_tokens = Math.min(Number(body.max_tokens) || 300, 300); _svc = 'img-prompt';
+      }
+      if (_svc) { body.agentMode = false; body.multiMode = null; body.webSearch = false; body.noWeb = true; _info.mode = _svc; }
+    }
+  } catch {}
   // ── NUOVO: tetto giornaliero solo per utenti Free (i Premium non hanno questo limite) ──
-  if (!isPremiumServer) {
+  if (!isPremiumServer && !_svc) {
     try {
       const freeCheck = await freeDailyLimiter.limit(clientIp);
       if (!freeCheck.success) {
@@ -1142,7 +1178,8 @@ async function handlerCore(req) {
   const model       = MODEL_ALIASES[body.model] || body.model || ACTIVE_MAIN;
   // ── NUOVO: forceWeb e multiMode sono feature Premium. Anche se il client
   // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
-  const forceWeb    = body.webSearch === true;   // 2026-10-09: ricerca web disponibile anche in modalita' Free
+  const _selfQ      = SELF_NOWEB_RE.test(getLastUserText(body.messages || []) || '') && !SELF_FORCE_WEB_RE.test(getLastUserText(body.messages || []) || '');
+  const forceWeb    = body.webSearch === true && !_selfQ;   // 2026-10-09: ricerca web disponibile anche in modalita' Free
   const agentMode   = body.agentMode === true;
   const multiMode   = isPremiumServer ? (body.multiMode || null) : null;
   const temperature = body.temperature != null ? body.temperature : 0.7;
@@ -1162,7 +1199,7 @@ async function handlerCore(req) {
   // messaggio contiene gli estratti del documento (altrimenti la ricerca partirebbe dall'intestazione degli estratti).
   const noWeb      = body.noWeb === true;
   const webQuery   = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery.trim().slice(0, 300) : '';
-  const searchText = webQuery || userText;
+  const searchText = geoEnrich(webQuery || userText, req);
   // 2026-10-16: con un documento allegato il messaggio inizia con l'intestazione degli estratti, identica per ogni domanda:
   // la cache (chiave = primi 200 caratteri) avrebbe restituito la risposta della prima domanda a tutte le successive.
   const cacheable  = !noWeb && !/^\s*\[(?:DOCUMENTO|MODALIT)/.test(String(userText));
@@ -1170,8 +1207,8 @@ async function handlerCore(req) {
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
-  let needsWeb = !noWeb && !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(searchText)));
-  if (!noWeb && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(searchText)));
+  if (!noWeb && !_selfQ && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
 
