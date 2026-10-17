@@ -4,6 +4,7 @@ import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
 import { generateImageWithFallback } from './lib/imageGen.js';
 import { loadConfig, prettyName } from './lib/modelConfig.js';
+import { logRequest } from './lib/reqlog.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
 // NOTA su OpenRouter (fallback): il catalogo dei modelli gratuiti cambia
@@ -1010,7 +1011,57 @@ function looksGarbledFinal(t) {
   return false;
 }
 
+// ── 2026-10-17: contatore token + registro richieste ─────────────────────────────────────────────
+// Ogni richiesta a /api/chat passa da qui: si contano i caratteri in ingresso/uscita (token stimati ≈ caratteri / 3,6),
+// si aggiunge in coda allo stream un evento {type:'usage'} (lo ignorano i vecchi client) e la richiesta viene registrata
+// in Redis (ultime 2000 + totali giornalieri). Il core del handler non cambia: scrive solo alcune note in REQINFO.
+const REQINFO = new WeakMap();
+const EST_CHARS_PER_TOKEN = 3.6;
 export default async function handler(req) {
+  const t0 = Date.now();
+  const info = { premium: false, ip: '', q: '', inChars: 0, mode: '', test: '', nav: false };
+  REQINFO.set(req, info);
+  const res = await handlerCore(req);
+  try {
+    const ct = String(res.headers.get('Content-Type') || '');
+    const base = () => ({ t: new Date().toISOString(), ms: Date.now() - t0, premium: info.premium, ip: info.ip, q: info.q, mode: info.mode, test: info.test, nav: info.nav, status: res.status });
+    if (!res.body || ct.indexOf('text/event-stream') < 0) {
+      if (info.q || info.inChars) await logRequest({ ...base(), tin: Math.round(info.inChars / EST_CHARS_PER_TOKEN), tout: 0, model: '', err: res.status >= 400 ? 'HTTP ' + res.status : '' });
+      return res;
+    }
+    const dec = new TextDecoder(), enc = new TextEncoder();
+    let buf = '', outChars = 0, model = '', provider = '', err = '';
+    const ts = new TransformStream({
+      transform(chunk, ctrl) {
+        ctrl.enqueue(chunk);
+        buf += dec.decode(chunk, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const ln of lines) {
+          if (ln.indexOf('data: ') !== 0) continue;
+          try {
+            const e = JSON.parse(ln.slice(6));
+            if (e.type === 'token') outChars += String(e.token || '').length;
+            else if (e.type === 'error') err = String(e.message || 'errore').slice(0, 120);
+            if (e.model) model = e.model;
+            if (e.provider) provider = e.provider;
+          } catch {}
+        }
+      },
+      async flush(ctrl) {
+        const tin = Math.round(info.inChars / EST_CHARS_PER_TOKEN), tout = Math.round(outChars / EST_CHARS_PER_TOKEN);
+        try { ctrl.enqueue(enc.encode('data: ' + JSON.stringify({ type: 'usage', tin, tout, est: true, ms: Date.now() - t0 }) + '\n\n')); } catch {}
+        try { await logRequest({ ...base(), tin, tout, model, provider, err: err || (outChars === 0 && !info.nav ? 'risposta vuota' : '') }); } catch {}
+      },
+    });
+    return new Response(res.body.pipeThrough(ts), { status: res.status, headers: res.headers });
+  } catch (e) {
+    console.log('[reqlog] errore (ignorato):', e && e.message);
+    return res;
+  }
+}
+
+async function handlerCore(req) {
+  const _info = REQINFO.get(req) || {};
   const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
   if (req.method === 'OPTIONS') return new Response(null, { status: 200, headers: cors });
   if (req.method !== 'POST')  return new Response('Method not allowed', { status: 405, headers: cors });
@@ -1018,6 +1069,7 @@ export default async function handler(req) {
   // ── NUOVO: chi è davvero questo utente? (verifica server-side, non fidarsi del client) ──
   const isPremiumServer = await verifyPremiumToken(req);
   const clientIp = getClientIp(req);
+  _info.premium = !!isPremiumServer; _info.ip = clientIp;
 
   // FIX: prima, se Upstash Redis aveva anche un piccolo intoppo momentaneo,
   // questi controlli non gestiti mandavano in crash l'intera funzione con
@@ -1044,10 +1096,20 @@ export default async function handler(req) {
   try { body = JSON.parse(await req.text()); }
   catch(e) { return new Response(JSON.stringify({ error: 'Invalid body' }), { status: 400, headers: { ...cors, 'Content-Type': 'application/json' } }); }
   try {
+    _info.test = typeof body.test === 'string' ? body.test.slice(0, 20) : '';
+    _info.mode = (body.multiMode ? 'multi' : '') + (body.agentMode ? 'agente' : '') + (body.noWeb ? 'solo-doc' : '') + (body.webSearch ? '+web' : '') || 'chat';
+    if (Array.isArray(body.messages)) {
+      _info.inChars = body.messages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length), 0);
+      const _lt = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery : getLastUserText(body.messages);
+      _info.q = /^\s*\[(?:DOCUMENTO|MODALIT)/.test(String(_lt)) ? '(documento allegato)' : String(_lt || '').replace(/\s+/g, ' ').slice(0, 160);
+    }
+  } catch {}
+  try {
     if (body.stream !== false && Array.isArray(body.messages)) {
       const _nt = getLastUserText(body.messages);
       const _nr = !messagesHaveImage(body.messages) ? navFastReply(_nt, body.messages) : null;
       if (_nr) {
+        _info.nav = true;
         console.log('[AI] NAV fast path: "' + String(_nt).slice(0, 40) + '"');
         const _rd = makeSSE(async (send) => {
           send({ type: 'meta', webSearchUsed: false });
