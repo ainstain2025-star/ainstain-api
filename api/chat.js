@@ -19,7 +19,23 @@ import { logRequest } from './lib/reqlog.js';
 // OpenRouter qui è solo la riserva, non il provider principale.
 const PROVIDER_CHAIN = [
   { name: 'Groq',       url: 'https://api.groq.com/openai/v1/chat/completions',       model: 'openai/gpt-oss-120b',                        keyEnv: 'GROQ_API_KEY' },
-  { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',          model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
+  // GEMINI (aggiunto 2026-10-19) — terzo motore, tra Groq e OpenRouter. Resta SPENTO finche' non esiste la
+  // variabile GEMINI_API_KEY su Vercel (getProviders scarta i provider senza chiave): deploy sicuro.
+  // CONDIZIONI GOOGLE (ai.google.dev/gemini-api/terms): per utenti nello Spazio Economico Europeo, in Svizzera e nel
+  // Regno Unito si possono usare SOLO i servizi a pagamento (con fatturazione attiva sul progetto); nel piano gratuito
+  // Google usa prompt e risposte per migliorare i prodotti e li fa leggere a revisori umani. Quindi: chiave di un
+  // progetto CON FATTURAZIONE. Il modello si cambia senza toccare il codice con GEMINI_MODEL (i nomi cambiano spesso).
+  // reasoning_effort 'low': i modelli Gemini 3 non possono spegnere il ragionamento e i token di ragionamento
+  // consumerebbero max_tokens. noDocs: i documenti allegati dagli utenti non vanno a Gemini (restano su Groq/OpenRouter).
+  { name: 'Gemini',     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: 'gemini-3.8-flash', keyEnv: 'GEMINI_API_KEY', extraBody: { reasoning_effort: 'low' }, noDocs: true },
+  // CLOUDFLARE WORKERS AI (aggiunto 2026-10-19) — terzo motore REALE, stesso modello di Groq (gpt-oss-120b), prima di OpenRouter.
+  // Resta SPENTO finche' non esistono su Vercel ENTRAMBE le variabili CLOUDFLARE_API_TOKEN e CLOUDFLARE_ACCOUNT_ID.
+  // Piano Free: 10.000 "neuron"/giorno (azzeramento 00:00 UTC), oltre il limite NON si paga: la richiesta fallisce e si passa
+  // al provider successivo. Dati: Cloudflare dichiara di non usare i contenuti per addestrare modelli e "zero data retention"
+  // (developers.cloudflare.com/workers-ai/platform/data-usage). Testato dall'utente il 2026-10-19: risposta 2,1 s, streaming OK.
+  // {ACCOUNT} viene sostituito in getProviders. noDocs: i documenti allegati sono lunghi e brucerebbero la quota giornaliera.
+  { name: 'Cloudflare', url: 'https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/v1/chat/completions', model: '@cf/openai/gpt-oss-120b', keyEnv: 'CLOUDFLARE_API_TOKEN', needEnv: 'CLOUDFLARE_ACCOUNT_ID', noDocs: true },
+  { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',         model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
 
 // AGGIORNAMENTO CRITICO 2026-09-11: llama-3.3-70b-versatile e
@@ -493,7 +509,22 @@ async function tavilySearch(query, apiKey) {
 }
 
 function getProviders(env) {
-  return PROVIDER_CHAIN.map(p => ({ ...p, apiKey: env[p.keyEnv] })).filter(p => p.apiKey);
+  return PROVIDER_CHAIN
+    .map(p => ({
+      ...p,
+      apiKey: env[p.keyEnv],
+      url: p.needEnv ? p.url.replace('{ACCOUNT}', encodeURIComponent(env[p.needEnv] || '')) : p.url,
+      model: (p.name === 'Gemini' && env.GEMINI_MODEL) ? env.GEMINI_MODEL : (p.name === 'Cloudflare' && env.CLOUDFLARE_MODEL) ? env.CLOUDFLARE_MODEL : p.model
+    }))
+    .filter(p => p.apiKey && (!p.needEnv || env[p.needEnv]));
+}
+
+// 2026-10-19: true se tra i messaggi c'e' un documento o una foto allegati dall'utente (intestazione "[DOCUMENTO ALLEGATO" o immagine).
+// I provider con noDocs (Gemini) vengono saltati: i documenti degli utenti non escono verso quel provider.
+function hasAttachedDoc(messages) {
+  return (messages || []).some(m =>
+    (typeof m.content === 'string' && m.content.indexOf('[DOCUMENTO ALLEGATO') !== -1) ||
+    (Array.isArray(m.content) && m.content.some(c => c && c.type === 'image_url'))); // anche le foto degli utenti
 }
 
 function makeSSE(fn) {
@@ -640,6 +671,7 @@ function fitForGroq(messages, maxTokens) {
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
+    if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato: documento allegato'); continue; }
     // FIX BUG CRITICO: prima "model || p.model" usava lo stesso nome
     // modello per TUTTI i provider — ma ogni provider ha una propria
     // nomenclatura (es. Groq: "llama-3.3-70b-versatile", OpenRouter:
@@ -657,7 +689,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
       const res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false }),
+        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false, ...(p.extraBody || {}) }),
         signal: AbortSignal.timeout(25000),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
@@ -748,6 +780,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
+    if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato (stream): documento allegato'); continue; }
     const fit = i === 0 ? fitForGroq(messages, maxTokens) : { messages, maxTokens };
     const requestedModel = i === 0 ? (model || p.model) : p.model;
     let useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
@@ -755,7 +788,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
       let res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true }),
+        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true, ...(p.extraBody || {}) }),
       });
       if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
       if (!res.ok) {
@@ -807,6 +840,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
       let pendingText = '';
       let validated = false;
       let invalidDetected = false;
+      let emitted = false; // 2026-10-19: true appena almeno un pezzo di testo e' stato inoltrato al client
       const CHECK_THRESHOLD = 20;
       streamLoop:
       while (true) {
@@ -828,19 +862,22 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
                     invalidDetected = true;
                   } else {
                     validated = true;
-                    onToken(pendingText);
+                    onToken(pendingText); emitted = true;
                     pendingText = '';
                   }
                 }
               } else {
-                onToken(tok);
+                onToken(tok); emitted = true;
               }
             }
             if (!invalidDetected && j.choices?.[0]?.finish_reason) {
               if (!validated && pendingText) {
                 if (looksLikeInvalidCompletion(pendingText)) invalidDetected = true;
-                else { onToken(pendingText); pendingText = ''; }
+                else { onToken(pendingText); emitted = true; pendingText = ''; }
               }
+              // 2026-10-19: risposta conclusa senza nemmeno un carattere (es. blocco di sicurezza di Gemini):
+              // si passa al provider successivo invece di lasciare una bolla vuota.
+              if (!invalidDetected && !emitted && !pendingText) invalidDetected = true;
               if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done', { model: useModel, provider: p.name });
             }
           } catch {}
