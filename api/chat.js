@@ -1273,7 +1273,30 @@ async function handlerCore(req) {
   // messaggio contiene gli estratti del documento (altrimenti la ricerca partirebbe dall'intestazione degli estratti).
   const noWeb      = body.noWeb === true;
   const webQuery   = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery.trim().slice(0, 300) : '';
-  const searchText = geoEnrich(webQuery || userText, req);
+  // ── 2026-10-20: domande di seguito ("e domani?", "e a Napoli?") — da sole non dicono cosa cercare: la ricerca web
+  // partiva con 2-3 parole senza contesto e non trovava nulla. Ora, se il messaggio è breve, si antepone la domanda precedente.
+  let searchBase = webQuery || userText;
+  if (!webQuery && !noWeb) {
+    const _ut = String(userText || '').trim();
+    const _w = (_ut.match(/\S+/g) || []).length;
+    if (_w > 0 && _w <= 6 && !/^(ok|okay|grazie|perfetto|va bene|bene|ciao|capito|s[iì]|no|ottimo|benissimo|chiaro)\b/i.test(_ut)) {
+      const _users = messages.filter(m => m.role === 'user');
+      for (let _i = _users.length - 2; _i >= 0; _i--) {
+        const _pt = String(extractText(_users[_i].content) || '').trim();
+        if (_pt && !/^\s*\[(?:DOCUMENTO|MODALIT)/.test(_pt)) { searchBase = _pt.slice(0, 160) + ' — ' + _ut; break; }
+      }
+    }
+  }
+  // 2026-10-20: "domani"/"dopodomani" -> aggiunge la data reale alla ricerca (le pagine meteo/eventi hanno la data, non la parola "domani")
+  {
+    const _tu = String(userText || '');
+    const _dd = /\bdopodomani\b/i.test(_tu) ? 2 : (/\bdomani\b/i.test(_tu) ? 1 : 0);
+    if (_dd) {
+      const _d = new Date(Date.now() + _dd * 86400000).toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+      searchBase += ' (previsioni ' + _d + ')';
+    }
+  }
+  const searchText = geoEnrich(searchBase, req);
   // 2026-10-16: con un documento allegato il messaggio inizia con l'intestazione degli estratti, identica per ogni domanda:
   // la cache (chiave = primi 200 caratteri) avrebbe restituito la risposta della prima domanda a tutte le successive.
   const cacheable  = !noWeb && !/^\s*\[(?:DOCUMENTO|MODALIT)/.test(String(userText));
