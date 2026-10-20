@@ -4,7 +4,7 @@ import { jwtVerify } from 'jose';
 import { freeDailyLimiter, abuseLimiter, getClientIp } from './lib/rateLimit.js';
 import { generateImageWithFallback } from './lib/imageGen.js';
 import { loadConfig, prettyName } from './lib/modelConfig.js';
-import { logRequest } from './lib/reqlog.js';
+import { logRequest, redisPipeline } from './lib/reqlog.js';
 
 // ── Provider chain ────────────────────────────────────────────────────
 // NOTA su OpenRouter (fallback): il catalogo dei modelli gratuiti cambia
@@ -659,9 +659,42 @@ function fitForGroq(messages, maxTokens) {
 }
 
 // ── Chiamata non-streaming con fallback ───────────────────────────────
+
+// ── 2026-10-20: account del provider bloccato (limite di spesa / fatturazione) + tetti giornalieri ──────────────────
+// Groq con "spend limit" raggiunto risponde 400 {"code":"blocked_api_access"} a TUTTE le chiavi: prima era un errore generico.
+// Ora lo riconosciamo, lo scriviamo chiaro nei log e saltiamo quel provider per 10 minuti (niente tentativi inutili).
+const blockedUntil = new Map();
+function isBlockedAccountError(status, message) {
+  if (status === 402) return true;
+  if (status === 400 || status === 403) return /blocked_api_access|spend.?limit|billing|insufficient.?(quota|funds|credit)|quota.?exceeded|account.*(blocked|suspended|disabled)/i.test(String(message || ''));
+  return false;
+}
+function markBlocked(name, message) {
+  blockedUntil.set(name, Date.now() + 10 * 60 * 1000);
+  console.log('[AI] ⛔ ACCOUNT BLOCCATO su ' + name + ' (limite di spesa o fatturazione): ' + String(message || '').slice(0, 160) + ' — provider saltato per 10 minuti. CONTROLLA la console del provider.');
+}
+function isSkippedBlocked(name) {
+  const t = blockedUntil.get(name);
+  if (!t) return false;
+  if (Date.now() > t) { blockedUntil.delete(name); return false; }
+  return true;
+}
+// Contatori giornalieri su Redis (stessa integrazione del registro). Se Redis non risponde: si lascia passare (fail-open).
+const CAP_WEB_GLOBAL = () => parseInt(process.env.WEB_DAILY_CAP || '30', 10);        // ricerche Tavily/giorno in totale (piano gratuito ~1000/mese)
+const CAP_WEB_IP     = () => parseInt(process.env.WEB_DAILY_CAP_IP || '8', 10);       // per utente (IP) al giorno
+const CAP_AGENT_IP   = () => parseInt(process.env.AGENT_DAILY_CAP || '15', 10);       // sessioni Agente per utente Premium al giorno
+async function bumpDaily(key, ttl) {
+  try {
+    const r = await redisPipeline([['INCR', key], ['EXPIRE', key, ttl || 172800]]);
+    return Number(r && r[0] && r[0].result) || 0;
+  } catch (e) { console.log('[cap] Redis non disponibile, tetto ignorato:', e.message); return 0; }
+}
+function dayKey() { return new Date().toISOString().slice(0, 10); }
+
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
+    if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato: account bloccato'); continue; }
     if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato: documento allegato'); continue; }
     // FIX BUG CRITICO: prima "model || p.model" usava lo stesso nome
     // modello per TUTTI i provider — ma ogni provider ha una propria
@@ -699,6 +732,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
           else if (parsed?.message) readableMsg = parsed.message;
         } catch {}
 
+        if (isBlockedAccountError(res.status, readableMsg + ' ' + errBody)) { markBlocked(p.name, readableMsg); continue; }
         // AUTO-RIPARAZIONE: il modello non esiste più (dismesso dal
         // provider). Marcalo e ritenta SUBITO con un'alternativa valida,
         // invece di degradare silenziosamente sul fallback casuale.
@@ -771,6 +805,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
+    if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato (stream): account bloccato'); continue; }
     if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato (stream): documento allegato'); continue; }
     const fit = i === 0 ? fitForGroq(messages, maxTokens) : { messages, maxTokens };
     const requestedModel = i === 0 ? (model || p.model) : p.model;
@@ -791,6 +826,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
           else if (parsed?.message) readableMsg = parsed.message;
         } catch {}
 
+        if (isBlockedAccountError(res.status, readableMsg + ' ' + errBody)) { markBlocked(p.name, readableMsg); continue; }
         // AUTO-RIPARAZIONE (stessa logica di callWithFallback)
         let recovered = false;
         if (i === 0 && isModelNotFoundError(res.status, readableMsg)) {
@@ -887,7 +923,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
   }
   // FIX 2026-10-16: se TUTTI i provider rispondono 429/503 il ciclo finiva in silenzio e al client arrivava una risposta vuota
   // (solo "meta"). Ora l'errore sale e makeSSE manda un evento 'error' leggibile.
-  throw new Error('Tutti i provider gratuiti sono al limite (429/503): riprova tra un minuto.');
+  throw new Error('Il servizio è temporaneamente al limite di capacità: riprova tra un minuto. Se persiste, scrivici dal sito.');
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1208,7 +1244,7 @@ async function handlerCore(req) {
   // li manda, li onoriamo SOLO se isPremiumServer è vero (verificato sopra).
   const _selfQ      = SELF_NOWEB_RE.test(getLastUserText(body.messages || []) || '') && !SELF_FORCE_WEB_RE.test(getLastUserText(body.messages || []) || '');
   const forceWeb    = body.webSearch === true && !_selfQ;   // 2026-10-09: ricerca web disponibile anche in modalita' Free
-  const agentMode   = body.agentMode === true;
+  let agentMode     = body.agentMode === true;
   const multiMode   = isPremiumServer ? (body.multiMode || null) : null;
   const temperature = body.temperature != null ? body.temperature : 0.7;
   const maxTokens   = body.max_tokens || 4096;
@@ -1222,6 +1258,16 @@ async function handlerCore(req) {
 
   const providers  = getProviders(process.env);
   const userText   = getLastUserText(messages);
+  // ── 2026-10-20: tetto Agente (solo Premium, per utente al giorno) ──
+  if (agentMode && !_svc) {
+    const nAg = await bumpDaily('ainstain:cap:agent:' + dayKey() + ':' + clientIp);
+    if (nAg > CAP_AGENT_IP()) {
+      return new Response(JSON.stringify({
+        error: 'Hai usato tutte le sessioni Agente di oggi (' + CAP_AGENT_IP() + '). Puoi continuare con la chat normale; l\'Agente si ricarica domani.',
+        rateLimited: true, agentCapReached: true,
+      }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
+    }
+  }
   // 2026-10-16: modalità "solo dal documento": noWeb=true -> nessuna ricerca web in nessun ramo (parole chiave, giudizio
   // semantico, multi-modello, agente). webQuery = la domanda pulita dell'utente: serve come testo di ricerca quando il
   // messaggio contiene gli estratti del documento (altrimenti la ricerca partirebbe dall'intestazione degli estratti).
@@ -1238,6 +1284,17 @@ async function handlerCore(req) {
   let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(searchText)));
   if (!noWeb && !_selfQ && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
+  }
+  // ── 2026-10-20: tetto ricerche web (globale e per utente). Oltre il tetto si risponde senza web, dichiarandolo. ──
+  let webCapNote = '';
+  if (needsWeb) {
+    const nG = await bumpDaily('ainstain:cap:web:' + dayKey());
+    const nU = nG ? await bumpDaily('ainstain:cap:webip:' + dayKey() + ':' + clientIp) : 0;
+    if ((nG && nG > CAP_WEB_GLOBAL()) || (nU && nU > CAP_WEB_IP())) {
+      needsWeb = false;
+      webCapNote = '\n\nNota di sistema: la ricerca web di oggi è esaurita. Rispondi con ciò che sai e DICHIARA all\'utente, in una frase, che non puoi cercare informazioni aggiornate fino a domani; non inventare dati in tempo reale.';
+      console.log('[cap] ricerca web negata: globale=' + nG + ' utente=' + nU);
+    }
   }
 
   // ── FIX 2026-09-19: data E ORA reali sempre note al modello, in TUTTE
@@ -1265,7 +1322,7 @@ async function handlerCore(req) {
     // Aggiungere una libreria per un caso così semplice è sproporzionato:
     // basta istruire il modello a non usarla mai.
     '\n\nNota di sistema: il sito NON supporta la notazione matematica LaTeX (mai usare \\[ \\], \\( \\), $$ o $ per formule) — verrebbe mostrata come testo grezzo illeggibile. Per calcoli e formule usa sempre testo semplice o markdown normale (es. "Prezzo scontato = Prezzo originale × 0,85", oppure una tabella).';
-  const realDateNoteFull = realDateNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText);
+  const realDateNoteFull = realDateNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote;
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
