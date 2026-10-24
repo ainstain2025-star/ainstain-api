@@ -1957,14 +1957,35 @@ async function handlerCore(req) {
   try {
     const readable = makeSSE(async (send) => {
       send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
-      await streamWithFallback(providers, finalMsgs, maxTokens, temperature, smartModel,
-        tok => send({ type: 'token', token: tok }),
-        // FIX 2026-09-19: propaga quale modello/provider ha risposto
-        // davvero (utile per il tag discreto "che modello ha risposto"
-        // in UI, e per capire al volo se è scattato l'auto-riparazione
-        // o il fallback su OpenRouter, senza dover aprire i log Vercel).
-        (reason, info) => send({ type: reason || 'done', model: info?.model, provider: info?.provider })
-      );
+      // 2026-10-24 (correzione dal test «12 lezioni da 6 slide»): se la risposta viene tagliata dal limite di token
+      // (finish_reason 'length' -> 'truncated') AInstAIn riprende da solo, nella stessa bolla, fino a AUTO_CONTINUE_MAX volte
+      // (default 3). Prima l'utente doveva scrivere «continua» a mano più volte. Alla ripresa si rimandano solo il sistema,
+      // l'ultima domanda e la coda di ciò che è già stato scritto, per restare nei limiti di token del motore.
+      const maxCont = Math.max(0, Math.min(5, parseInt(process.env.AUTO_CONTINUE_MAX || '3', 10) || 0));
+      let acc = '', cont = 0, lastInfo = null;
+      for (;;) {
+        let reason = null, info = null;
+        let msgs = finalMsgs;
+        if (cont > 0) {
+          const sysMsgs = finalMsgs.filter(m => m.role === 'system');
+          const lastUser = [...finalMsgs].reverse().find(m => m.role === 'user');
+          msgs = [...sysMsgs, lastUser,
+            { role: 'assistant', content: acc.slice(-4000) },
+            { role: 'user', content: 'La tua risposta si è interrotta per il limite di lunghezza. Riprendi ESATTAMENTE dal punto in cui ti sei fermato (anche a metà frase), senza ripetere nulla di ciò che hai già scritto, senza introduzioni e senza scusarti. Mantieni lo stesso formato e la stessa lingua, e completa tutto ciò che la richiesta iniziale chiedeva.' }];
+        }
+        await streamWithFallback(providers, msgs, maxTokens, temperature, smartModel,
+          tok => { acc += tok; send({ type: 'token', token: tok }); },
+          // FIX 2026-09-19: propaga quale modello/provider ha risposto davvero (tag discreto in UI e diagnosi senza aprire i log)
+          (r, i) => { reason = r; info = i; }
+        );
+        lastInfo = info || lastInfo;
+        if (reason === 'truncated' && cont < maxCont && acc.length > 200) {
+          cont++; console.log('[AI] risposta troncata: ripresa automatica ' + cont + '/' + maxCont + ' (' + acc.length + ' caratteri finora)');
+          continue;
+        }
+        send({ type: reason || 'done', model: (info || lastInfo)?.model, provider: (info || lastInfo)?.provider });
+        break;
+      }
     });
     return new Response(readable, { status: 200, headers: sseH });
   } catch(e) {
