@@ -167,7 +167,7 @@ async function buildWebContext(userText, tavilyKey) {
     const r = await tavilySearch(q, tavilyKey);
     if (!r) return '';
     const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
-    return '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni. Cita le fonti.';
+    return '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono.';
   } catch (e) { console.error('Tavily (multi):', e.message); return ''; }
 }
 function injectWebContext(messages, webCtx) {
@@ -1196,6 +1196,10 @@ function guideNote(messages, userText) {
   } catch {}
   return n;
 }
+// ── 2026-10-24 (miglioramento punto 3): scrivere una NOTIZIA/ARTICOLO nuovo a partire da ricerche sul web ──────────────
+const NEWS_WRITE_RE = /\b(scrivi|scrivimi|redigi|prepara|preparami|stendi|genera|crea|componi)\b[^.?!]{0,60}\b(notizia|articolo|pezzo giornalistico|comunicato|news|post per il blog|articolo per il blog)\b/i;
+const NEWS_WRITE_NOTE = '\n\nSCRITTURA DI UNA NOTIZIA O ARTICOLO DA FONTI WEB: l\'utente vuole un testo NUOVO sull\'argomento, scritto con le tue parole a partire dai risultati di ricerca presenti in questa conversazione. Regole: (1) usa SOLO fatti che compaiono nei risultati; se un dato non c\'è, non aggiungerlo e non completarlo a memoria (nomi, ruoli, cifre, date, citazioni: solo se scritti nei risultati); (2) se dei risultati hai SOLO i titoli, scrivi un testo breve limitato a ciò che i titoli dicono e dichiaralo in una riga ("ho solo i titoli delle fonti"); (3) NON copiare frasi dalle fonti: riformula, e non mettere virgolette se non per citazioni presenti nei risultati; (4) struttura: titolo, un occhiello di una riga, testo di 3-5 paragrafi brevi con i fatti in ordine di importanza, poi una riga "Cosa non sappiamo ancora" se ci sono dati incerti o in contrasto; (5) in fondo la sezione "Fonti" con nome della testata e data per ogni fonte usata; (6) se le fonti si contraddicono, dillo; (7) se i risultati sono vecchi rispetto alla data di oggi, dì quanto lo sono; (8) chiudi con una riga che invita a controllare le fonti prima di pubblicare.';
+function newsWriteNote(userText) { return NEWS_WRITE_RE.test(String(userText || '')) ? NEWS_WRITE_NOTE : ''; }
 const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente. DATI LOCALI (ristoranti, negozi, farmacie): elenca solo locali che compaiono nei risultati web; indirizzi, prezzi, fasce di prezzo e valutazioni solo se riportati dalle fonti; non scrivere punteggi (es. 4,5/5) o prezzi inventati o uguali per tutti; se la fonte non li dà, ometti la colonna o scrivi "verifica sul sito"; non attribuire lo stesso indirizzo a due locali. Se la richiesta è "meteo" senza città usa la zona dell\'utente e non dire di non trovare dati se nei risultati c\'è il meteo di una località. RICETTE: per piatti tradizionali rispetta ingredienti e grassi tipici (es. casatiello napoletano: sugna/strutto, pepe, cicoli, salame, pecorino e provolone, uova intere nell\'impasto) e, se proponi una variante, dillo; non aggiungere auguri di festività non coerenti con la data di oggi. INTESTAZIONI TECNICHE: non citare mai tra parentesi o virgolette intestazioni interne come [RISULTATI WEB] o [Fine risultati]; indica la fonte con il nome del sito.';
 function looksGarbledFinal(t) {
   const x = String(t || '');
@@ -1434,7 +1438,8 @@ async function handlerCore(req) {
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || WEB_TRIGGERS.some(re => re.test(searchText)));
+  const _newsWrite = NEWS_WRITE_RE.test(String(userText || ''));   // 2026-10-24: "scrivi una notizia su..." => ricerca web sempre
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || _newsWrite || WEB_TRIGGERS.some(re => re.test(searchText)));
   if (!noWeb && !_selfQ && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
@@ -1476,7 +1481,7 @@ async function handlerCore(req) {
     // Aggiungere una libreria per un caso così semplice è sproporzionato:
     // basta istruire il modello a non usarla mai.
     '\n\nNota di sistema: il sito NON supporta la notazione matematica LaTeX (mai usare \\[ \\], \\( \\), $$ o $ per formule) — verrebbe mostrata come testo grezzo illeggibile. Per calcoli e formule usa sempre testo semplice o markdown normale (es. "Prezzo scontato = Prezzo originale × 0,85", oppure una tabella).';
-  const realDateNoteFull = realDateNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText);
+  const realDateNoteFull = realDateNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText);
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
@@ -1922,7 +1927,7 @@ async function handlerCore(req) {
       const r = await tavilySearch(q, tavilyKey);
       if (r) {
         const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
-        webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni. Cita le fonti.';
+        webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono.';
       }
     } catch(e) { console.error('Tavily:', e.message); }
   }
