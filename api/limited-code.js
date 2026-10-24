@@ -51,5 +51,5 @@ export default async function handler(req) {
     ['HSET', INDEX_KEY, code, val],
   ]);
   return json({ codice: code, email, giorni: days, scade: new Date(exp).toISOString(),
-    testo_email: 'Ciao! Ecco il tuo accesso gratuito a AInstAIn Premium per ' + days + ' giorni: vai su https://ainstain.site, clicca su Premium e inserisci il codice ' + code + '. Il codice è personale e scade il ' + new Date(exp).toLocaleDateString('it-IT') + '. Grazie di provarci!' });
+    testo_email: 'Ciao! Ecco il tuo accesso gratuito a AInstAIn Premium per ' + days + ' giorni: vai su https://ainstain.site, clicca su Premium e inserisci il codice ' + code + '. Il codice è personale e scade il ' + new Date(exp).toLocaleDateString('it-IT') + '. Grazie per il tuo tempo!' });
 }
