@@ -549,7 +549,9 @@ async function verifyPremiumToken(req) {
   try {
     const secretKey = new TextEncoder().encode(process.env.JWT_SECRET);
     const { payload } = await jwtVerify(token, secretKey);
-    return payload.premium === true;
+    // 2026-10-24: livello PREMIUM_LIMITED (token con tier:'limited'). Restituisce 'limited', true (Premium pieno) oppure false.
+    if (payload.premium !== true) return false;
+    return payload.tier === 'limited' ? 'limited' : true;
   } catch {
     return false; // token assente, scaduto o manomesso
   }
@@ -683,6 +685,10 @@ function isSkippedBlocked(name) {
 const CAP_WEB_GLOBAL = () => parseInt(process.env.WEB_DAILY_CAP || '30', 10);        // ricerche Tavily/giorno in totale (piano gratuito ~1000/mese)
 const CAP_WEB_IP     = () => parseInt(process.env.WEB_DAILY_CAP_IP || '8', 10);       // per utente (IP) al giorno
 const CAP_AGENT_IP   = () => parseInt(process.env.AGENT_DAILY_CAP || '15', 10);       // sessioni Agente per utente Premium al giorno
+// 2026-10-24: tetti del livello PREMIUM_LIMITED (per IP al giorno). Si cambiano da Vercel senza ripubblicare il sito.
+const CAP_LIM_MSG    = () => parseInt(process.env.LIMITED_MSG_CAP || '60', 10);       // messaggi al giorno
+const CAP_LIM_MULTI  = () => parseInt(process.env.LIMITED_MULTI_CAP || '8', 10);      // Sintesi Multi-AI al giorno (oltre: chat normale)
+const CAP_LIM_AGENT  = () => parseInt(process.env.LIMITED_AGENT_CAP || '5', 10);      // sessioni Agente al giorno
 async function bumpDaily(key, ttl) {
   try {
     const r = await redisPipeline([['INCR', key], ['EXPIRE', key, ttl || 172800]]);
@@ -1251,6 +1257,18 @@ async function handlerCore(req) {
     }
   }
 
+  // ── 2026-10-24: PREMIUM_LIMITED — tetto di messaggi al giorno (i servizi interni come titolo/img-prompt non contano) ──
+  const isLimited = isPremiumServer === 'limited';
+  if (isLimited && !_svc) {
+    const nMsg = await bumpDaily('ainstain:cap:lim-msg:' + dayKey() + ':' + clientIp);
+    if (nMsg > CAP_LIM_MSG()) {
+      return new Response(JSON.stringify({
+        error: 'Hai usato tutti i messaggi di oggi del tuo accesso di prova (' + CAP_LIM_MSG() + '). Si ricaricano domani.',
+        rateLimited: true, limitedCapReached: true,
+      }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
+    }
+  }
+
   const messages    = body.messages || [];
   await applyModelConfig(process.env);
   const model       = MODEL_ALIASES[body.model] || body.model || ACTIVE_MAIN;
@@ -1259,7 +1277,7 @@ async function handlerCore(req) {
   const _selfQ      = SELF_NOWEB_RE.test(getLastUserText(body.messages || []) || '') && !SELF_FORCE_WEB_RE.test(getLastUserText(body.messages || []) || '');
   const forceWeb    = body.webSearch === true && !_selfQ;   // 2026-10-09: ricerca web disponibile anche in modalita' Free
   let agentMode     = body.agentMode === true;
-  const multiMode   = isPremiumServer ? (body.multiMode || null) : null;
+  let multiMode     = isPremiumServer ? (body.multiMode || null) : null;
   const temperature = body.temperature != null ? body.temperature : 0.7;
   const maxTokens   = body.max_tokens || 4096;
 
@@ -1275,12 +1293,18 @@ async function handlerCore(req) {
   // ── 2026-10-20: tetto Agente (solo Premium, per utente al giorno) ──
   if (agentMode && !_svc) {
     const nAg = await bumpDaily('ainstain:cap:agent:' + dayKey() + ':' + clientIp);
-    if (nAg > CAP_AGENT_IP()) {
+    const capAg = isLimited ? CAP_LIM_AGENT() : CAP_AGENT_IP();
+    if (nAg > capAg) {
       return new Response(JSON.stringify({
-        error: 'Hai usato tutte le sessioni Agente di oggi (' + CAP_AGENT_IP() + '). Puoi continuare con la chat normale; l\'Agente si ricarica domani.',
+        error: 'Hai usato tutte le sessioni Agente di oggi (' + capAg + '). Puoi continuare con la chat normale; l\'Agente si ricarica domani.',
         rateLimited: true, agentCapReached: true,
       }), { status: 429, headers: { ...cors, 'Content-Type': 'application/json' } });
     }
+  }
+  // 2026-10-24: PREMIUM_LIMITED — Sintesi Multi-AI a numero chiuso al giorno; oltre il tetto si risponde con la chat normale
+  if (isLimited && multiMode && !_svc) {
+    const nMu = await bumpDaily('ainstain:cap:lim-multi:' + dayKey() + ':' + clientIp);
+    if (nMu > CAP_LIM_MULTI()) { multiMode = null; console.log('[cap] limited: Multi-AI oltre tetto, passo alla chat normale'); }
   }
   // 2026-10-16: modalità "solo dal documento": noWeb=true -> nessuna ricerca web in nessun ramo (parole chiave, giudizio
   // semantico, multi-modello, agente). webQuery = la domanda pulita dell'utente: serve come testo di ricerca quando il
