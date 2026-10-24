@@ -195,6 +195,8 @@ const WEB_TRIGGERS = [
   // "cerca" come richiesta esplicita di ricerca a prescindere dal resto.
   /\b(prezzo|prezzi|costa|costano|costerebbe|sconto|scontato|offerta|offerte)\b/i,
   /\bcerca\b/i,
+  // FIX 2026-10-24 (stress test 1.030, p03/p02/p07): programmi TV e sport senza parole di tempo esplicite
+  /\b(stasera|stanotte|questa sera|palinsesto|programmi? tv|in tv|serie a|serie b|champions|atp|wta|formula 1|motogp)\b/i,
 ];
 // Le regex CALC_RE/IMAGE_RE/DATETIME_RE/REMEMBER_RE del vecchio dispatcher
 // a singolo tool non servono più: ora è l'AI stessa a scegliere lo
@@ -488,15 +490,99 @@ function getLastUserText(messages) {
 // NOTA 2026-09-19: buildPollinationsUrl ora vive in ./lib/imageGen.js
 // insieme al provider di backup (Hugging Face) — vedi generateImageWithFallback.
 
-async function tavilySearch(query, apiKey) {
-  const res = await fetch('https://api.tavily.com/search', {
+// ── RICERCA WEB A CATENA (2026-10-24, richiesta VinDimax: "la freshness non puo' essere una debolezza") ─────────
+// Ordine: Tavily -> Brave Search -> Serper (Google) -> Google News RSS -> DuckDuckGo. Ogni anello e' indipendente: se uno
+// non ha la chiave, ha finito la quota o va in errore, si passa al successivo. Gli ultimi due non richiedono chiavi e non
+// hanno tetto. Per le domande di attualita' i titoli di Google News (con data) vengono AGGIUNTI anche quando un motore
+// risponde, cosi' la notizia piu' recente non dipende da un solo fornitore. Chiavi opzionali su Vercel:
+// TAVILY_API_KEY, BRAVE_API_KEY, SERPER_API_KEY. La chiave speciale 'KEYLESS' salta i motori a chiave (tetto raggiunto).
+const NEWSY_RE = /\b(notizie|news|ultime|ultim[oai]|oggi|ieri|stasera|stanotte|adesso|ha vinto|hanno vinto|risultat\w*|classifica|partita|sinner|serie a|champions|governo|elezioni|incidente|sciopero|borsa)\b/i;
+function decEnt(t) {
+  return String(t || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;|&#x27;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+async function fetchTimeout(url, opts, ms) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), ms || 6000);
+  try { return await fetch(url, { ...(opts || {}), signal: ctl.signal }); } finally { clearTimeout(tm); }
+}
+async function searchTavily(query, apiKey) {
+  const res = await fetchTimeout('https://api.tavily.com/search', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ api_key: apiKey, query, search_depth: 'advanced', max_results: 5, include_answer: true }),
-  });
+  }, 9000);
   if (!res.ok) throw new Error('Tavily ' + res.status);
   const data = await res.json();
   const answer = data.answer ? 'Risposta diretta: ' + data.answer + '\n\n' : '';
   return answer + (data.results || []).map(r => '- ' + r.title + ': ' + (r.content || '') + ' (' + r.url + ')').join('\n');
+}
+async function searchBrave(query, key) {
+  const res = await fetchTimeout('https://api.search.brave.com/res/v1/web/search?count=5&country=it&search_lang=it&q=' + encodeURIComponent(query),
+    { headers: { 'Accept': 'application/json', 'X-Subscription-Token': key } }, 7000);
+  if (!res.ok) throw new Error('Brave ' + res.status);
+  const data = await res.json();
+  return ((data.web && data.web.results) || []).slice(0, 5).map(r => '- ' + decEnt(r.title) + ': ' + decEnt(r.description) + ' (' + r.url + ')').join('\n');
+}
+async function searchSerper(query, key) {
+  const res = await fetchTimeout('https://google.serper.dev/search', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-KEY': key },
+    body: JSON.stringify({ q: query, gl: 'it', hl: 'it', num: 5 }),
+  }, 7000);
+  if (!res.ok) throw new Error('Serper ' + res.status);
+  const data = await res.json();
+  const ab = data.answerBox ? 'Risposta diretta: ' + decEnt(data.answerBox.answer || data.answerBox.snippet || '') + '\n\n' : '';
+  return (ab.length > 22 ? ab : '') + (data.organic || []).slice(0, 5).map(r => '- ' + decEnt(r.title) + ': ' + decEnt(r.snippet) + ' (' + r.link + ')').join('\n');
+}
+async function searchGoogleNews(query) {
+  const res = await fetchTimeout('https://news.google.com/rss/search?hl=it&gl=IT&ceid=IT:it&q=' + encodeURIComponent(query), { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AInstAIn/1.0)' } }, 6000);
+  if (!res.ok) throw new Error('GoogleNews ' + res.status);
+  const xml = await res.text();
+  const items = xml.split('<item>').slice(1, 7);
+  const out = items.map(it => {
+    const g = tag => { const m = it.match(new RegExp('<' + tag + '[^>]*>([\\s\\S]*?)</' + tag + '>')); return m ? decEnt(m[1]) : ''; };
+    const d = g('pubDate'); const src = g('source');
+    return '- ' + g('title') + (d ? ' [' + d.replace(/ \d\d:\d\d:\d\d.*$/, '') + ']' : '') + (src ? ' — ' + src : '') + ' (' + g('link') + ')';
+  }).filter(x => x.length > 12);
+  return out.length ? 'Titoli recenti (Google News):\n' + out.join('\n') : '';
+}
+async function searchDuckDuckGo(query) {
+  const res = await fetchTimeout('https://html.duckduckgo.com/html/?kl=it-it&q=' + encodeURIComponent(query), { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AInstAIn/1.0)' } }, 6000);
+  if (!res.ok) throw new Error('DuckDuckGo ' + res.status);
+  const html = await res.text();
+  const blocks = html.split('class="result__a"').slice(1, 7);
+  const out = blocks.map(b => {
+    const href = (b.match(/href="([^"]+)"/) || [])[1] || '';
+    let url = href; const u = href.match(/uddg=([^&]+)/); if (u) { try { url = decodeURIComponent(u[1]); } catch {} }
+    const title = decEnt((b.match(/>([\s\S]*?)<\/a>/) || [])[1]);
+    const sn = decEnt((b.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/) || [])[1]);
+    return title ? '- ' + title + ': ' + sn + ' (' + url + ')' : '';
+  }).filter(Boolean).slice(0, 5);
+  return out.join('\n');
+}
+async function tavilySearch(query, apiKey) {
+  const keyed = apiKey && apiKey !== 'KEYLESS';
+  const chain = [];
+  if (keyed) chain.push(['Tavily', () => searchTavily(query, apiKey)]);
+  if (apiKey !== 'KEYLESS' && process.env.BRAVE_API_KEY) chain.push(['Brave', () => searchBrave(query, process.env.BRAVE_API_KEY)]);
+  if (apiKey !== 'KEYLESS' && process.env.SERPER_API_KEY) chain.push(['Serper', () => searchSerper(query, process.env.SERPER_API_KEY)]);
+  const newsy = NEWSY_RE.test(query);
+  let main = '', used = '';
+  for (const [name, fn] of chain) {
+    try { const r = await fn(); if (r && r.trim().length > 20) { main = r; used = name; break; } console.log('[web] ' + name + ' senza risultati'); }
+    catch (e) { console.log('[web] ' + name + ' fallito: ' + e.message); }
+  }
+  let news = '';
+  if (newsy || !main) {
+    try { news = await searchGoogleNews(query); if (news) used += (used ? '+' : '') + 'GoogleNews'; } catch (e) { console.log('[web] GoogleNews fallito: ' + e.message); }
+  }
+  if (!main && !news) {
+    try { main = await searchDuckDuckGo(query); if (main) used = 'DuckDuckGo'; } catch (e) { console.log('[web] DuckDuckGo fallito: ' + e.message); }
+  }
+  console.log('[web] motore usato: ' + (used || 'NESSUNO') + ' <- "' + String(query).slice(0, 60) + '"');
+  const res = [main, news].filter(Boolean).join('\n\n');
+  if (!res) throw new Error('nessun motore di ricerca ha risposto');
+  return res;
 }
 
 function getProviders(env) {
@@ -1052,6 +1138,12 @@ function navFastReply(userText, messages) {
       ? 'Sure! Send me the text you want to translate and the target language (e.g. "translate to Spanish: ...") and I\'ll do it here. You can also use Google Translate: https://translate.google.com'
       : 'Certo! Scrivimi il testo da tradurre e la lingua di arrivo (es. "traduci in spagnolo: ...") e lo faccio subito qui. In alternativa puoi usare Google Traduttore: https://translate.google.com';
   }
+  // FIX 2026-10-24 (stress test 1.030, p15): "diretta" da sola e' ambigua -> si chiede di cosa, con risposta fissa
+  if (/^(la )?(in )?(diretta|live)$/.test(core) || /^(in )?(diretta|live)$/.test(full)) {
+    return en
+      ? 'What would you like to follow live? Tell me which one:\n\n- a **match** (which one?)\n- a **TV programme or channel** (which one?)\n- the **news** (TV news, a press conference, an event?)\n\nGive me the name and I\'ll look it up for you.'
+      : 'Cosa vuoi seguire in diretta? Dimmi quale:\n\n- una **partita** (quale?)\n- un **programma o un canale TV** (quale?)\n- le **notizie** (telegiornale, conferenza stampa, un evento?)\n\nDammi il nome e te lo cerco.';
+  }
   const hit = NAV_SITES.find(s => s.al.includes(full) || s.al.includes(core));
   if (!hit) return null;
   const url = (en && hit.urlEn) ? hit.urlEn : hit.url;
@@ -1282,7 +1374,7 @@ async function handlerCore(req) {
   const maxTokens   = body.max_tokens || 4096;
 
   const groqKey   = process.env.GROQ_API_KEY;
-  const tavilyKey = process.env.TAVILY_API_KEY;
+  let tavilyKey = process.env.TAVILY_API_KEY || 'KEYLESS'; // senza chiave si usano comunque i motori senza chiave
   // Opzionale: se assente, la generazione immagine usa solo Pollinations
   // (come prima, ma ora con verifica reale invece che alla cieca).
   const hfKey     = process.env.HUGGINGFACE_API_KEY;
@@ -1352,9 +1444,10 @@ async function handlerCore(req) {
     const nG = await bumpDaily('ainstain:cap:web:' + dayKey());
     const nU = nG ? await bumpDaily('ainstain:cap:webip:' + dayKey() + ':' + clientIp) : 0;
     if ((nG && nG > CAP_WEB_GLOBAL()) || (nU && nU > CAP_WEB_IP())) {
-      needsWeb = false;
-      webCapNote = '\n\nNota di sistema: la ricerca web di oggi è esaurita. Rispondi con ciò che sai e DICHIARA all\'utente, in una frase, che non puoi cercare informazioni aggiornate fino a domani; non inventare dati in tempo reale.';
-      console.log('[cap] ricerca web negata: globale=' + nG + ' utente=' + nU);
+      // 2026-10-24: tetto raggiunto = NIENTE rifiuto e niente risposta a memoria: si passa ai motori senza chiave
+      // (Google News, DuckDuckGo) che non hanno tetto. Il tetto protegge solo le quote dei motori a chiave.
+      tavilyKey = 'KEYLESS';
+      console.log('[cap] tetto motori a chiave raggiunto: globale=' + nG + ' utente=' + nU + ' -> motori senza chiave');
     }
   }
 
@@ -1832,6 +1925,20 @@ async function handlerCore(req) {
         webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni. Cita le fonti.';
       }
     } catch(e) { console.error('Tavily:', e.message); }
+  }
+
+  // 2026-10-24: se serviva il web e NESSUN motore ha risposto, non si lascia rispondere il modello a memoria (inventa):
+  // messaggio fisso e onesto.
+  if (shouldSearch && !webCtx) {
+    const _enF = !/^(italian|italiano)$/.test(navDetectLang(messages));
+    const _failMsg = _enF
+      ? 'I could not reach any search source right now, and this question needs up-to-date information. To avoid giving you old or made-up data I would rather not answer from memory. Please try again in a few minutes.'
+      : 'In questo momento non riesco a raggiungere nessuna fonte di ricerca e questa domanda richiede dati aggiornati. Per non darti informazioni vecchie o inventate preferisco non rispondere a memoria. Riprova tra qualche minuto.';
+    return new Response(makeSSE(async (send) => {
+      send({ type: 'meta', webSearchUsed: false });
+      for (let i = 0; i < _failMsg.length; i += 4) send({ type: 'token', token: _failMsg.slice(i, i + 4) });
+      send({ type: 'done' });
+    }), { status: 200, headers: sseH });
   }
 
   let finalMsgs = [...messages];
