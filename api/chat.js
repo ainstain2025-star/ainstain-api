@@ -26,6 +26,15 @@ const PROVIDER_CHAIN = [
   // (developers.cloudflare.com/workers-ai/platform/data-usage). Testato dall'utente il 2026-10-19: risposta 2,1 s, streaming OK.
   // {ACCOUNT} viene sostituito in getProviders. noDocs: i documenti allegati sono lunghi e brucerebbero la quota giornaliera.
   { name: 'Cloudflare', url: 'https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/v1/chat/completions', model: '@cf/openai/gpt-oss-120b', keyEnv: 'CLOUDFLARE_API_TOKEN', needEnv: 'CLOUDFLARE_ACCOUNT_ID', noDocs: true },
+  // NUOVI MOTORI GRATUITI (aggiunti 2026-10-25) — ognuno e' un serbatoio di quota indipendente da Groq, Cloudflare e OpenRouter.
+  // Restano SPENTI finche' non esiste su Vercel la rispettiva variabile (SAMBANOVA_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY).
+  // Il modello si puo' cambiare senza toccare il codice con SAMBANOVA_MODEL, MISTRAL_MODEL, GEMINI_MODEL (cosi' un nome ritirato non obbliga a un nuovo deploy).
+  // noDocs: i documenti e le foto degli utenti NON escono verso questi tre (nei piani gratuiti di Google e Mistral i contenuti possono servire ad addestrare i modelli).
+  // Tetti gratuiti verificati il 2026-10-25: SambaNova 20 richieste e 200.000 token/giorno; Mistral e Gemini limiti non pubblicati.
+  // Se uno risponde 429/503/errore, il codice passa al successivo senza mostrare nulla all'utente.
+  { name: 'SambaNova',  url: 'https://api.sambanova.ai/v1/chat/completions',                         model: 'DeepSeek-V3.1',                              keyEnv: 'SAMBANOVA_API_KEY', noDocs: true },
+  { name: 'Mistral',    url: 'https://api.mistral.ai/v1/chat/completions',                           model: 'mistral-small-latest',                       keyEnv: 'MISTRAL_API_KEY',   noDocs: true },
+  { name: 'Gemini',     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: 'gemini-3.8-flash',                       keyEnv: 'GEMINI_API_KEY',    noDocs: true },
   { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',         model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
 
@@ -591,7 +600,7 @@ function getProviders(env) {
       ...p,
       apiKey: env[p.keyEnv],
       url: p.needEnv ? p.url.replace('{ACCOUNT}', encodeURIComponent(env[p.needEnv] || '')) : p.url,
-      model: (p.name === 'Cloudflare' && env.CLOUDFLARE_MODEL) ? env.CLOUDFLARE_MODEL : p.model
+      model: (p.name !== 'Groq' && env[p.name.toUpperCase() + '_MODEL']) ? env[p.name.toUpperCase() + '_MODEL'] : p.model
     }))
     .filter(p => p.apiKey && (!p.needEnv || env[p.needEnv]));
 }
