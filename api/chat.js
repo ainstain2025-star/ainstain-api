@@ -176,7 +176,7 @@ async function buildWebContext(userText, tavilyKey) {
     const r = await tavilySearch(q, tavilyKey);
     if (!r) return '';
     const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
-    return '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono.';
+    return '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono. La conversazione precedente resta valida: se i risultati riguardano un argomento o un oggetto diverso da quello di cui si sta parlando (per esempio un altro prodotto), ignorali e rispondi usando la conversazione, senza dire che i risultati non lo riportano.';
   } catch (e) { console.error('Tavily (multi):', e.message); return ''; }
 }
 function injectWebContext(messages, webCtx) {
@@ -447,6 +447,56 @@ async function executeReActTool(name, input, ctx) {
     default:
       return 'Strumento "' + name + '" non riconosciuto.';
   }
+}
+
+// ── 2026-10-27: contesto nella ricerca web (caso "rubinetto" -> "cartuccia": la ricerca partiva solo dall'ultimo messaggio
+// e trovava cartucce di stampanti). Se l'ultima domanda non nomina nulla di ciò di cui si parlava prima, si antepone
+// la domanda precedente. Prima valeva solo per messaggi di 6 parole o meno e saltava quelli che iniziano con "Ok".
+const FOLLOWUP_SKIP_RE = /^(?:(?:ok|okay|grazie|mille|perfetto|va bene|bene|ciao|capito|s[iì]|no|ottimo|benissimo|chiaro)\W*){1,3}$/i;
+function sigWords(t) {
+  return new Set((String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').match(/[a-z0-9]{5,}/g) || []));
+}
+function withConversationContext(userText, messages) {
+  const ut = String(userText || '').trim();
+  const nWords = (ut.match(/\S+/g) || []).length;
+  if (!nWords || nWords > 40 || FOLLOWUP_SKIP_RE.test(ut)) return userText;
+  const users = (messages || []).filter(m => m.role === 'user');
+  for (let i = users.length - 2; i >= 0; i--) {
+    const pt = String(extractText(users[i].content) || '').trim();
+    if (!pt || /^\s*\[(?:DOCUMENTO|MODALIT)/.test(pt)) continue;
+    const a = sigWords(ut), b = sigWords(pt);
+    let common = 0; a.forEach(w => { if (b.has(w)) common++; });
+    if (nWords > 6 && common > 0) return userText;   // l'ultima domanda nomina già qualcosa di cui si parlava prima
+    if (nWords <= 6) return pt.slice(0, 80) + ' — ' + ut.slice(0, 115);   // seguito breve: prima l'argomento, poi la domanda
+    return ut.slice(0, 120) + ' — contesto: ' + pt.slice(0, 60);          // frase più lunga: resta in primo piano la domanda (può essere un cambio di argomento)
+  }
+  return userText;
+}
+
+// ── 2026-10-27 SPEECH CONSECUTIO CHECK ────────────────────────────────────────────────────────────────
+// Dopo il primo messaggio si PRESUME che la conversazione continui sullo stesso argomento. Il client chiede un giudizio
+// di coerenza (purpose 'scc') e manda il risultato in body.scc: {connected, topic, web}. Se connected, la ricerca web parte
+// dall'argomento della conversazione e il modello riceve l'ordine di restare su di esso. Se NON connected, logica normale.
+const SCC_SYSTEM = 'Sei il controllo di coerenza di una chat. Ricevi: ARGOMENTO (sintesi della conversazione finora), ULTIMI SCAMBI, ALLEGATI e NUOVO MESSAGGIO. ' +
+  'Per DEFAULT il nuovo messaggio è la prosecuzione della conversazione: domande brevi, di dettaglio, pronomi, "e se...", "quanto costa", "dove lo trovo", correzioni, ringraziamenti sono SEMPRE collegati. ' +
+  'Rispondi connected=false SOLO se il messaggio è chiaramente su un tutt\'altro argomento senza alcun legame con la conversazione. ' +
+  'web=true se per rispondere bene serve cercare sul web (prodotti, prezzi, codici, normative, notizie, disponibilità) sull\'argomento della conversazione. ' +
+  'attachments: se connected=true metti "keep". Se connected=false metti "drop", TRANNE quando il messaggio richiama esplicitamente un allegato (anche uno "messo da parte"): allora "keep". ' +
+  'topic = argomento attuale in massimo 12 parole (se connected, aggiornalo includendo il nuovo messaggio). ' +
+  'Rispondi SOLO con JSON valido su una riga: {"connected":true,"topic":"...","web":false,"attachments":"keep"}';
+function sccClean(raw){
+  try{
+    if(!raw||typeof raw!=='object') return null;
+    const topic=String(raw.topic||'').replace(/\s+/g,' ').trim().slice(0,160);
+    return { connected: raw.connected!==false, topic, web: raw.web===true };
+  }catch{ return null; }
+}
+function sccSearchBase(text, scc){
+  const ut=String(text||'').trim();
+  if(!scc||!scc.connected||!scc.topic) return ut;
+  const a=sigWords(ut), b=sigWords(scc.topic); let common=0; a.forEach(w=>{if(b.has(w))common++});
+  if((ut.match(/\S+/g)||[]).length>8 && common>=2) return ut;
+  return ut.slice(0,120)+' — '+scc.topic.slice(0,100);
 }
 
 // ── Cache risposte ────────────────────────────────────────────────────
@@ -1332,9 +1382,16 @@ async function handlerCore(req) {
   // limitate dal server (testo e token massimi, nessuna ricerca web né agente): non si possono usare come chat gratuita.
   let _svc = '';
   try {
-    if ((body.purpose === 'title' || body.purpose === 'imgprompt') && body.stream === false && Array.isArray(body.messages)) {
+    if ((body.purpose === 'title' || body.purpose === 'imgprompt' || body.purpose === 'scc') && body.stream === false && Array.isArray(body.messages)) {
       const _um = getLastUserText(body.messages) || '';
-      if (body.purpose === 'title' && _um.length <= 200) {
+      if (body.purpose === 'scc' && _um.length <= 1800) {
+        // 2026-10-27 "speech consecutio check": giudizio di coerenza tra il nuovo messaggio e la conversazione in corso.
+        body.messages = [
+          { role: 'system', content: SCC_SYSTEM },
+          { role: 'user', content: _um.slice(0, 1800) }
+        ];
+        body.max_tokens = 110; body.temperature = 0.1; _svc = 'scc';
+      } else if (body.purpose === 'title' && _um.length <= 200) {
         body.messages = [
           { role: 'system', content: 'Genera un titolo brevissimo (massimo 5 parole) per questa conversazione. Rispondi SOLO con il titolo, niente virgolette, niente punteggiatura finale, nella stessa lingua del messaggio.' },
           { role: 'user', content: _um.slice(0, 120) }
@@ -1418,17 +1475,11 @@ async function handlerCore(req) {
   const webQuery   = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery.trim().slice(0, 300) : '';
   // ── 2026-10-20: domande di seguito ("e domani?", "e a Napoli?") — da sole non dicono cosa cercare: la ricerca web
   // partiva con 2-3 parole senza contesto e non trovava nulla. Ora, se il messaggio è breve, si antepone la domanda precedente.
+  const scc = sccClean(body.scc);
   let searchBase = webQuery || userText;
-  if (!webQuery && !noWeb) {
-    const _ut = String(userText || '').trim();
-    const _w = (_ut.match(/\S+/g) || []).length;
-    if (_w > 0 && _w <= 6 && !/^(ok|okay|grazie|perfetto|va bene|bene|ciao|capito|s[iì]|no|ottimo|benissimo|chiaro)\b/i.test(_ut)) {
-      const _users = messages.filter(m => m.role === 'user');
-      for (let _i = _users.length - 2; _i >= 0; _i--) {
-        const _pt = String(extractText(_users[_i].content) || '').trim();
-        if (_pt && !/^\s*\[(?:DOCUMENTO|MODALIT)/.test(_pt)) { searchBase = _pt.slice(0, 160) + ' — ' + _ut; break; }
-      }
-    }
+  if (!noWeb) {
+    if (scc) searchBase = scc.connected ? sccSearchBase(webQuery || userText, scc) : (webQuery || userText);   // SCC: collegato => ricerca sull'argomento della conversazione; scollegato => logica normale
+    else if (!webQuery) searchBase = withConversationContext(userText, messages);                              // senza SCC (client vecchio / controllo non riuscito): regola di ripiego
   }
   // 2026-10-20: "domani"/"dopodomani" -> aggiunge la data reale alla ricerca (le pagine meteo/eventi hanno la data, non la parola "domani")
   {
@@ -1448,7 +1499,7 @@ async function handlerCore(req) {
 
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
   const _newsWrite = NEWS_WRITE_RE.test(String(userText || ''));   // 2026-10-24: "scrivi una notizia su..." => ricerca web sempre
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || _newsWrite || WEB_TRIGGERS.some(re => re.test(searchText)));
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || WEB_TRIGGERS.some(re => re.test(searchText)));
   if (!noWeb && !_selfQ && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
@@ -1490,7 +1541,10 @@ async function handlerCore(req) {
     // Aggiungere una libreria per un caso così semplice è sproporzionato:
     // basta istruire il modello a non usarla mai.
     '\n\nNota di sistema: il sito NON supporta la notazione matematica LaTeX (mai usare \\[ \\], \\( \\), $$ o $ per formule) — verrebbe mostrata come testo grezzo illeggibile. Per calcoli e formule usa sempre testo semplice o markdown normale (es. "Prezzo scontato = Prezzo originale × 0,85", oppure una tabella).';
-  const realDateNoteFull = realDateNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText);
+  const sccNote = (scc && scc.connected && scc.topic)
+    ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
+    : '';
+  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText);
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
@@ -1936,7 +1990,7 @@ async function handlerCore(req) {
       const r = await tavilySearch(q, tavilyKey);
       if (r) {
         const today = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
-        webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono.';
+        webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono. La conversazione precedente resta valida: se i risultati riguardano un argomento o un oggetto diverso da quello di cui si sta parlando (per esempio un altro prodotto), ignorali e rispondi usando la conversazione, senza dire che i risultati non lo riportano.';
       }
     } catch(e) { console.error('Tavily:', e.message); }
   }
