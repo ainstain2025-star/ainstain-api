@@ -1,32 +1,32 @@
-// FIX/FEATURE 2026-09-27: come api/generate-image.js, funzione Node.js
-// standard (non Edge) — Hugging Face non è affidabile sotto Edge Runtime
-// (vedi note in generate-image.js e imageGen.js per il dettaglio scoperto
-// nella sessione precedente). Questo endpoint non fa streaming, quindi
-// Node.js va benissimo (chat.js resta su Edge per l'SSE).
-
+// api/edit-image.js — Modifica di un'immagine caricata (image-to-image)
+// 2026-09-27: creato (Hugging Face). 2026-10-31: aggiunto Cloudflare come motore
+// principale gratuito + limite giornaliero per IP (per proteggere i 10.000 neuron/giorno).
+// Funzione Node.js standard (non Edge), come generate-image.js.
 export const config = { maxDuration: 60 };
 
 import { editImageWithFallback } from './lib/imageGen.js';
 
-// ════════════════════════════════════════════════════════════════════════
-// api/edit-image.js — Editing reale di un'immagine caricata (image-to-image)
-// ════════════════════════════════════════════════════════════════════════
-// Creato 2026-09-27 per colmare un gap scoperto in test dal vivo: l'utente
-// caricava una foto e chiedeva di trasformarla (stile, sfondo, aggiunte),
-// ma AInstAIn aveva solo due pipeline separate — analisi immagine (Qwen
-// Vision, immagine→testo) e generazione immagine (Pollinations/HF,
-// testo→immagine nuova) — nessuna delle due accetta un'immagine di
-// partenza da modificare davvero. Questo endpoint usa Hugging Face
-// (FLUX.1-Kontext-dev, via api/lib/imageGen.js) per l'editing vero e
-// proprio: immagine + istruzione → nuova immagine modificata.
-//
-// IMPORTANTE (onestà sui limiti, vedi imageGen.js per il dettaglio):
-// - Richiede HUGGINGFACE_API_KEY configurata — senza, l'editing non è
-//   disponibile (a differenza della generazione da testo, che ha
-//   Pollinations gratuito come principale).
-// - La quota gratuita Hugging Face ($0.10/mese per account free) è
-//   condivisa con il fallback di generazione testo→immagine già in uso —
-//   non è una risorsa illimitata, va monitorata.
+const EDIT_DAILY_LIMIT = Number(process.env.EDIT_DAILY_LIMIT || 10); // modifiche al giorno per IP
+
+// Limite per IP su Upstash Redis. Se Redis non è configurato o dà errore, NON blocca (fail-open).
+async function underLimit(ip) {
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) return true;
+  try {
+    const { Ratelimit } = await import('@upstash/ratelimit');
+    const { Redis } = await import('@upstash/redis');
+    const rl = new Ratelimit({
+      redis: Redis.fromEnv(),
+      limiter: Ratelimit.slidingWindow(EDIT_DAILY_LIMIT, '1 d'),
+      prefix: 'ainstain:edit-image',
+    });
+    const r = await rl.limit(ip);
+    return r.success;
+  } catch (e) {
+    console.log('[edit-image] limiter non disponibile:', String(e.message || e));
+    return true;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -36,31 +36,46 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') { res.status(405).send('Method not allowed'); return; }
 
   const body = req.body || {};
-  const image = String(body.image || '').trim();       // data URL base64 dell'immagine caricata
-  const prompt = String(body.prompt || '').trim();      // istruzione di modifica
+  const image = String(body.image || '').trim();              // data URL dell'immagine (originale)
+  const imageSmall = String(body.imageSmall || '').trim();    // copia ridotta (< 512 px) per Cloudflare
+  const prompt = String(body.prompt || '').trim();            // istruzione di modifica
+  const w = Number(body.w) || 0, h = Number(body.h) || 0;    // dimensioni dell'originale
 
   if (!image) { res.status(400).json({ error: 'immagine mancante' }); return; }
   if (!prompt) { res.status(400).json({ error: 'istruzione di modifica mancante' }); return; }
 
   const hfKey = process.env.HUGGINGFACE_API_KEY;
-  console.log('[edit-image] runtime: nodejs | hfKey presente:', !!hfKey, '| prompt:', prompt.slice(0, 60));
+  const cfToken = process.env.CLOUDFLARE_API_TOKEN;
+  const cfAccount = process.env.CLOUDFLARE_ACCOUNT_ID;
+  console.log('[edit-image] hf:', !!hfKey, '| cf:', !!(cfToken && cfAccount), '| prompt:', prompt.slice(0, 60));
 
-  if (!hfKey) {
+  if (!hfKey && !(cfToken && cfAccount)) {
     res.status(503).json({
-      error: 'La modifica di immagini caricate non è ancora configurata su questo deploy (manca HUGGINGFACE_API_KEY).',
-      detail: 'HUGGINGFACE_API_KEY non impostata',
+      error: 'La modifica di immagini non è ancora configurata su questo deploy.',
+      detail: 'Servono CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID oppure HUGGINGFACE_API_KEY',
+    });
+    return;
+  }
+
+  const fwd = req.headers && (req.headers['x-forwarded-for'] || req.headers['x-real-ip']);
+  const ip = String(fwd || 'unknown').split(',')[0].trim();
+  if (!(await underLimit(ip))) {
+    res.status(429).json({
+      error: 'Hai raggiunto il limite giornaliero di modifiche immagine (' + EDIT_DAILY_LIMIT + '). Riprova domani.',
+      rateLimited: true,
     });
     return;
   }
 
   try {
-    const result = await editImageWithFallback(image, prompt, { hfKey });
-    console.log('[edit-image] successo, provider:', result.provider);
+    const result = await editImageWithFallback(image, prompt, {
+      hfKey, cfToken, cfAccount, imageSmall, w, h, primary: process.env.EDIT_PRIMARY,
+    });
     res.status(200).json({ url: result.url, provider: result.provider });
   } catch (err) {
     console.log('[edit-image] fallito:', String(err.message || err));
     res.status(502).json({
-      error: 'Modifica immagine fallita. Il servizio di editing (Hugging Face) potrebbe essere temporaneamente sovraccarico, oppure la quota gratuita mensile potrebbe essere esaurita.',
+      error: 'Modifica immagine fallita. I servizi di editing potrebbero essere temporaneamente sovraccarichi o la quota gratuita giornaliera esaurita.',
       detail: String(err.message || err),
     });
   }
