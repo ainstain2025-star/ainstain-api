@@ -209,17 +209,69 @@ async function editWithHuggingFace(imageInput, mimeType, instruction, hfKey) {
   return `data:${contentType};base64,${base64}`;
 }
 
+// ── Cloudflare Workers AI: FLUX.2 klein 4B (aggiunto 2026-10-31) ──────────
+// Secondo motore per la modifica di immagini. Il piano gratuito Cloudflare dà
+// 10.000 "neuron" al giorno (si azzerano alle 00:00 UTC), molto più dei $0.10/mese
+// di Hugging Face. Dalla documentazione Cloudflare (changelog 2026-01-15): il modello
+// accetta fino a 4 immagini in ingresso (campi multipart input_image_0..3), ciascuna
+// più piccola di 512x512; width/height in uscita da 256 a 1920; steps fisso a 4.
+// Per questo il client invia anche una copia ridotta (imageSmall) e le dimensioni
+// dell'originale (w, h) per mantenere le proporzioni in uscita.
+// NON ancora provato dal vivo (nessun accesso a Cloudflare da qui): prova con una
+// vera richiesta dopo il deploy. Se fallisce, si passa a Hugging Face.
+function cfOutputSize(w, h) {
+  const W = Number(w) || 0, H = Number(h) || 0;
+  if (!W || !H) return { width: 768, height: 768 };
+  const k = 768 / Math.max(W, H);
+  const r16 = (v) => Math.min(1920, Math.max(256, Math.round((v * k) / 16) * 16));
+  return { width: r16(W), height: r16(H) };
+}
+
+async function editWithCloudflare(smallDataUrl, instruction, cf) {
+  if (!cf || !cf.token || !cf.account) {
+    throw new Error('Cloudflare non configurato: mancano CLOUDFLARE_API_TOKEN e/o CLOUDFLARE_ACCOUNT_ID.');
+  }
+  const m = /^data:([^;]+);base64,(.+)$/.exec(String(smallDataUrl || ''));
+  if (!m) throw new Error('Cloudflare: manca la copia ridotta dell\'immagine (imageSmall).');
+  const buf = Buffer.from(m[2], 'base64');
+  const { width, height } = cfOutputSize(cf.w, cf.h);
+  const form = new FormData();
+  form.append('prompt', String(instruction).slice(0, 1000));
+  form.append('input_image_0', new Blob([buf], { type: m[1] || 'image/jpeg' }), 'input.jpg');
+  form.append('width', String(width));
+  form.append('height', String(height));
+  const url = 'https://api.cloudflare.com/client/v4/accounts/' + encodeURIComponent(cf.account) +
+              '/ai/run/@cf/black-forest-labs/flux-2-klein-4b';
+  const res = await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + cf.token }, body: form });
+  const ct = res.headers.get('content-type') || '';
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.text()).slice(0, 300); } catch {}
+    throw new Error('Cloudflare HTTP ' + res.status + ' ' + detail);
+  }
+  if (ct.startsWith('image/')) {
+    const b = Buffer.from(await res.arrayBuffer());
+    return 'data:' + ct.split(';')[0] + ';base64,' + b.toString('base64');
+  }
+  const j = await res.json().catch(() => null);
+  const img = j && j.result && (typeof j.result === 'string' ? j.result : j.result.image);
+  if (!j || j.success === false || !img) {
+    throw new Error('Cloudflare: risposta senza immagine ' + JSON.stringify(j && j.errors || j).slice(0, 200));
+  }
+  const mime = img.startsWith('/9j/') ? 'image/jpeg' : img.startsWith('iVBOR') ? 'image/png' : 'image/jpeg';
+  return 'data:' + mime + ';base64,' + img;
+}
+
 /**
  * Modifica un'immagine esistente in base a un'istruzione testuale
- * (image-to-image). A differenza di generateImageWithFallback, NON ha
- * Pollinations come opzione: Pollinations genera solo da testo, non
- * accetta un'immagine di partenza da modificare. Hugging Face è quindi
- * l'UNICO provider per questa funzione — se non configurato o se fallisce,
- * l'errore va propagato onestamente (nessun secondo fallback disponibile
- * oggi per questa capacità specifica).
- * @param {string} imageDataUrl - data URL (data:image/...;base64,...) dell'immagine caricata dall'utente
- * @param {string} instruction - istruzione testuale (es. "trasforma in stile anime, rimuovi lo sfondo")
- * @param {{hfKey?: string}} opts
+ * (image-to-image). Pollinations non è usabile (genera solo da testo).
+ * Motori, in ordine (cambiabile con la variabile EDIT_PRIMARY = "hf" o "cf"):
+ *   1. Cloudflare FLUX.2 klein 4B (gratuito, 10.000 neuron/giorno) — default
+ *   2. Hugging Face FLUX.2 klein 9B (qualità migliore, ma credito gratuito di $0.10/mese)
+ * Se il primo fallisce passa al secondo; se falliscono entrambi l'errore è propagato.
+ * @param {string} imageDataUrl - data URL dell'immagine (originale, anche grande)
+ * @param {string} instruction
+ * @param {{hfKey?: string, cfToken?: string, cfAccount?: string, imageSmall?: string, w?: number, h?: number, primary?: string}} opts
  * @returns {Promise<{url: string, provider: string}>}
  */
 export async function editImageWithFallback(imageDataUrl, instruction, opts = {}) {
@@ -230,14 +282,34 @@ export async function editImageWithFallback(imageDataUrl, instruction, opts = {}
   const mimeType = match[1];
   const imageBuffer = Buffer.from(match[2], 'base64');
 
-  try {
-    const dataUrl = await editWithHuggingFace(imageBuffer, mimeType, instruction, opts.hfKey);
-    console.log('[imageGen] Editing Hugging Face OK');
-    return { url: dataUrl, provider: 'Hugging Face (FLUX.1 Kontext)' };
-  } catch (err) {
-    console.log('[imageGen] Editing Hugging Face fallito:', err.message);
-    throw err;
+  const engines = {
+    cf: {
+      ok: !!(opts.cfToken && opts.cfAccount),
+      label: 'Cloudflare (FLUX.2 klein)',
+      run: () => editWithCloudflare(opts.imageSmall, instruction,
+        { token: opts.cfToken, account: opts.cfAccount, w: opts.w, h: opts.h }),
+    },
+    hf: {
+      ok: !!opts.hfKey,
+      label: 'Hugging Face (FLUX.2 klein)',
+      run: () => editWithHuggingFace(imageBuffer, mimeType, instruction, opts.hfKey),
+    },
+  };
+  const order = (opts.primary === 'hf' ? ['hf', 'cf'] : ['cf', 'hf']).filter((k) => engines[k].ok);
+  if (!order.length) throw new Error('Nessun motore di editing configurato (servono CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID oppure HUGGINGFACE_API_KEY).');
+
+  const errors = [];
+  for (const k of order) {
+    try {
+      const url = await engines[k].run();
+      console.log('[imageGen] Editing OK con', engines[k].label);
+      return { url, provider: engines[k].label };
+    } catch (err) {
+      console.log('[imageGen] Editing fallito con', engines[k].label + ':', err.message);
+      errors.push(engines[k].label + ': ' + String(err.message || err).slice(0, 200));
+    }
   }
+  throw new Error(errors.join(' | '));
 }
 
 /**
