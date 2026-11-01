@@ -219,10 +219,11 @@ async function editWithHuggingFace(imageInput, mimeType, instruction, hfKey) {
 // dell'originale (w, h) per mantenere le proporzioni in uscita.
 // NON ancora provato dal vivo (nessun accesso a Cloudflare da qui): prova con una
 // vera richiesta dopo il deploy. Se fallisce, si passa a Hugging Face.
-function cfOutputSize(w, h) {
+function cfOutputSize(w, h, maxSide) {
+  maxSide = maxSide || 768;
   const W = Number(w) || 0, H = Number(h) || 0;
-  if (!W || !H) return { width: 768, height: 768 };
-  const k = 768 / Math.max(W, H);
+  if (!W || !H) return { width: maxSide, height: maxSide };
+  const k = maxSide / Math.max(W, H);
   const r16 = (v) => Math.min(1920, Math.max(256, Math.round((v * k) / 16) * 16));
   return { width: r16(W), height: r16(H) };
 }
@@ -234,7 +235,7 @@ async function editWithCloudflare(smallDataUrl, instruction, cf) {
   const m = /^data:([^;]+);base64,(.+)$/.exec(String(smallDataUrl || ''));
   if (!m) throw new Error('Cloudflare: manca la copia ridotta dell\'immagine (imageSmall).');
   const buf = Buffer.from(m[2], 'base64');
-  const { width, height } = cfOutputSize(cf.w, cf.h);
+  const { width, height } = cfOutputSize(cf.w, cf.h, cf.maxSide);
   const form = new FormData();
   form.append('prompt', String(instruction).slice(0, 1000));
   form.append('input_image_0', new Blob([buf], { type: m[1] || 'image/jpeg' }), 'input.jpg');
@@ -271,7 +272,7 @@ async function editWithCloudflare(smallDataUrl, instruction, cf) {
  * Se il primo fallisce passa al secondo; se falliscono entrambi l'errore è propagato.
  * @param {string} imageDataUrl - data URL dell'immagine (originale, anche grande)
  * @param {string} instruction
- * @param {{hfKey?: string, cfToken?: string, cfAccount?: string, imageSmall?: string, w?: number, h?: number, primary?: string}} opts
+ * @param {{hfKey?: string, cfToken?: string, cfAccount?: string, imageSmall?: string, imageMid?: string, w?: number, h?: number, primary?: string}} opts
  * @returns {Promise<{url: string, provider: string}>}
  */
 export async function editImageWithFallback(imageDataUrl, instruction, opts = {}) {
@@ -286,8 +287,23 @@ export async function editImageWithFallback(imageDataUrl, instruction, opts = {}
     cf: {
       ok: !!(opts.cfToken && opts.cfAccount),
       label: 'Cloudflare (FLUX.2 klein)',
-      run: () => editWithCloudflare(opts.imageSmall, instruction,
-        { token: opts.cfToken, account: opts.cfAccount, w: opts.w, h: opts.h }),
+      // 2026-11-01: prima prova con la copia grande (~1024 px: più pixel per ogni volto, meno deformazioni);
+      // se Cloudflare la rifiuta (la sua pagina parla di limite 512 px) ripiega sulla copia piccola.
+      run: async () => {
+        const base = { token: opts.cfToken, account: opts.cfAccount, w: opts.w, h: opts.h };
+        if (opts.imageMid) {
+          try {
+            const u = await editWithCloudflare(opts.imageMid, instruction, { ...base, maxSide: 1024 });
+            engines.cf.label = 'Cloudflare (FLUX.2 klein, input grande)';
+            return u;
+          } catch (e) {
+            console.log('[imageGen] Cloudflare con input grande fallito, riprovo con input piccolo:', String(e.message || e).slice(0, 200));
+          }
+        }
+        const u = await editWithCloudflare(opts.imageSmall, instruction, { ...base, maxSide: 768 });
+        engines.cf.label = 'Cloudflare (FLUX.2 klein, input piccolo)';
+        return u;
+      },
     },
     hf: {
       ok: !!opts.hfKey,

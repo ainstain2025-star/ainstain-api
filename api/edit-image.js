@@ -37,7 +37,8 @@ export default async function handler(req, res) {
 
   const body = req.body || {};
   const image = String(body.image || '').trim();              // data URL dell'immagine (originale)
-  const imageSmall = String(body.imageSmall || '').trim();    // copia ridotta (< 512 px) per Cloudflare
+  const imageSmall = String(body.imageSmall || '').trim();    // copia ridotta (480 px) per Cloudflare
+  const imageMid = String(body.imageMid || '').trim();        // copia media (1024 px): provata per prima, meno deformazioni sui visi
   const prompt = String(body.prompt || '').trim();            // istruzione di modifica
   const w = Number(body.w) || 0, h = Number(body.h) || 0;    // dimensioni dell'originale
 
@@ -69,7 +70,7 @@ export default async function handler(req, res) {
 
   try {
     const result = await editImageWithFallback(image, prompt, {
-      hfKey, cfToken, cfAccount, imageSmall, w, h, primary: process.env.EDIT_PRIMARY,
+      hfKey, cfToken, cfAccount, imageSmall, imageMid, w, h, primary: process.env.EDIT_PRIMARY,
     });
     res.status(200).json({ url: result.url, provider: result.provider });
   } catch (err) {
