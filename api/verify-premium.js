@@ -13,7 +13,7 @@ const TOKEN_TTL = '180d';
 //    fine 2 nov 24:00 ora italiana = 2 nov 23:00 UTC. Per aggiungerne altri senza toccare il codice:
 //    variabile Vercel LIMITED_PUBLIC = "CODICE|2026-10-30T23:00:00Z|2026-11-02T23:00:00Z;ALTRO|...|..."
 const LIMITED_PUBLIC_DEFAULT = [
-  { code: 'HALLOWEEN26', from: '2026-10-30T23:00:00Z', to: '2026-11-02T23:00:00Z' },
+  // HALLOWEEN26 (31 ott - 2 nov 2026) scaduto e rimosso il 4 nov 2026. Nuovi codici: variabile LIMITED_PUBLIC (vedi sopra).
 ];
 function limitedPublicList(env) {
   const list = LIMITED_PUBLIC_DEFAULT.slice();

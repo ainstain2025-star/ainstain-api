@@ -1,9 +1,12 @@
 // api/edit-image.js — Modifica di un'immagine caricata (image-to-image)
+// 2026-11-04: controllo Premium lato server (voce 2.373): serve il token firmato da verify-premium.js (header Authorization: Bearer).
+//   Si spegne solo con la variabile Vercel EDIT_REQUIRE_PREMIUM=0 (utile come marcia indietro immediata, senza nuovo deploy).
 // 2026-09-27: creato (Hugging Face). 2026-10-31: aggiunto Cloudflare come motore
 // principale gratuito + limite giornaliero per IP (per proteggere i 10.000 neuron/giorno).
 // Funzione Node.js standard (non Edge), come generate-image.js.
 export const config = { maxDuration: 60 };
 
+import { jwtVerify } from 'jose';
 import { editImageWithFallback } from './lib/imageGen.js';
 
 const EDIT_DAILY_LIMIT = Number(process.env.EDIT_DAILY_LIMIT || 10); // modifiche al giorno per IP
@@ -27,13 +30,33 @@ async function underLimit(ip) {
   }
 }
 
+// Verifica il token Premium (JWT firmato da api/verify-premium.js). Vale anche il livello 'limited' (codici a tempo).
+// Ritorna true/false; token assente, scaduto o manomesso => false.
+async function isPremiumRequest(req) {
+  const raw = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
+  const token = String(raw).startsWith('Bearer ') ? String(raw).slice(7) : null;
+  if (!token || !process.env.JWT_SECRET) return false;
+  try {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(process.env.JWT_SECRET));
+    return payload.premium === true;
+  } catch (e) {
+    return false;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
   if (req.method !== 'POST') { res.status(405).send('Method not allowed'); return; }
+
+  // 2026-11-04 (2.373): prima di leggere il corpo (pesante) si controlla il Premium.
+  if (process.env.EDIT_REQUIRE_PREMIUM !== '0' && !(await isPremiumRequest(req))) {
+    res.status(401).json({ error: 'La modifica delle foto con l\'IA è riservata a chi ha Premium. Attiva Premium e riprova.', needPremium: true });
+    return;
+  }
 
   const body = req.body || {};
   const image = String(body.image || '').trim();              // data URL dell'immagine (originale)
