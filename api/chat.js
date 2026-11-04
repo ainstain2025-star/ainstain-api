@@ -249,7 +249,7 @@ const MAX_REACT_STEPS = 8;
 // il loop quando il browser rimanda il risultato (agentResume). Strumenti web spenti: un file ostile non
 // deve poter far uscire dati dell'utente con una ricerca o con l'apertura di un indirizzo.
 const FOLDER_MAX_STEPS = 12;
-const FOLDER_CLIENT_TOOLS = /^fs_(list|read|search)$/;
+const FOLDER_CLIENT_TOOLS = /^fs_(list|read|search|propose_edit)$/;
 const FOLDER_SERVER_TOOLS = new Set(['get_current_datetime', 'calculate']);
 function cleanResumeSteps(raw) {
   const out = [];
@@ -269,12 +269,20 @@ function buildFolderSystemPrompt(baseSystemPrompt) {
 
 ---
 MODALITÀ CARTELLA (ragionamento multi-step sui file di una cartella scelta dall'utente sul suo computer).
-Sei in SOLA LETTURA: puoi esplorare e leggere i file, NON puoi modificarli, cancellarli, crearli o eseguirli. Se servono modifiche, spiega cosa cambiare e scrivi nella risposta il testo corretto, così l'utente può copiarlo.
+Puoi esplorare e leggere i file. NON puoi cancellarli, rinominarli o eseguirli. Puoi solo PROPORRE una modifica a un file di testo (o la creazione di un file nuovo) con fs_propose_edit: l'utente vede l'anteprima e il file cambia soltanto se preme «Applica». Non dire mai che hai modificato un file: hai solo proposto la modifica.
 
 Strumenti disponibili:
 - fs_list: elenca file e sottocartelle. Input: percorso relativo alla cartella scelta (es. "." per la radice, oppure "src").
 - fs_read: legge un file di testo, a pezzi di circa 6000 caratteri. Input: "percorso" oppure "percorso | inizio" dove inizio è la posizione del carattere da cui continuare (te la indica il risultato precedente quando il file continua).
 - fs_search: cerca un testo nei file della cartella. Input: "testo da cercare" oppure "testo da cercare | percorso" per limitare a una sottocartella.
+- fs_propose_edit: propone una modifica a un file di testo, mostrata all'utente con anteprima. Input su più righe, ESATTAMENTE così:
+percorso/del/file
+<<<VECCHIO
+il testo da sostituire, copiato identico dal file (deve comparire una sola volta: includi righe vicine se serve)
+<<<NUOVO
+il testo che lo sostituisce
+<<<FINE
+Per creare un file nuovo (che non esiste) lascia vuoto VECCHIO. Prima di proporre, leggi il file con fs_read. Una proposta piccola e mirata per volta (massimo 3 per richiesta); dopo averla fatta, chiudi con FINAL_ANSWER.
 - get_current_datetime: data e ora attuali in UTC. Input: "-".
 - calculate: calcolo matematico vero. Input: l'espressione (es. "150 * 0.20").
 
@@ -1927,13 +1935,13 @@ async function handlerCore(req) {
         // (con tutti i passi fatti finora) e chiude lo stream; il browser rimanda tutto con agentResume.
         if (folderMode && parsed.action) {
           if (FOLDER_CLIENT_TOOLS.test(parsed.action)) {
-            send({ type: 'agent_client_tool', tool: parsed.action, input: String(parsed.actionInput || '').slice(0, 500), next_step: step + 1,
+            send({ type: 'agent_client_tool', tool: parsed.action, input: String(parsed.actionInput || '').slice(0, parsed.action === 'fs_propose_edit' ? 8000 : 500), next_step: step + 1,
                    steps: reactMessages.slice(_stepsBase).concat([{ role: 'assistant', content: stepText }]) });
             return;
           }
           if (!FOLDER_SERVER_TOOLS.has(parsed.action)) {
             reactMessages.push({ role: 'assistant', content: stepText });
-            reactMessages.push({ role: 'user', content: 'OBSERVATION: Lo strumento "' + parsed.action + '" non è disponibile in modalità cartella. Usa solo fs_list, fs_read, fs_search, get_current_datetime, calculate, oppure rispondi con FINAL_ANSWER.' });
+            reactMessages.push({ role: 'user', content: 'OBSERVATION: Lo strumento "' + parsed.action + '" non è disponibile in modalità cartella. Usa solo fs_list, fs_read, fs_search, fs_propose_edit, get_current_datetime, calculate, oppure rispondi con FINAL_ANSWER.' });
             continue;
           }
         }
