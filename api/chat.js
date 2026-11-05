@@ -305,6 +305,8 @@ REGOLE:
 5. Alcuni file sensibili (chiavi, password, file .env) sono bloccati e non si possono leggere: se il risultato lo dice, riferiscilo e prosegui senza.
 6. Usa uno strumento alla volta e aspetta sempre il risultato prima di continuare. Se un'azione identica non ti ha aiutato, non ripeterla: rispondi con quello che sai.
 7. Hai al massimo ${FOLDER_MAX_STEPS} passi totali: arrivare a un buon FINAL_ANSWER entro il limite è meglio che restare bloccato.
+8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi.
+9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
 ---`;
 }
 
@@ -1911,6 +1913,27 @@ async function handlerCore(req) {
           reactMessages.push({ role: 'assistant', content: stepText });
           reactMessages.push({ role: 'user', content: 'OBSERVATION: ERRORE: la mappa NON è stata mostrata, perché non hai chiamato show_map. Chiamalo ORA, in questo formato esatto:\nTHOUGHT: mostro la mappa\nACTION: show_map\nACTION_INPUT: <solo il nome del luogo>\nPoi, dopo l\'OBSERVATION, rispondi con FINAL_ANSWER breve. Se la domanda non riguarda un luogo geografico, rispondi normalmente con FINAL_ANSWER.' });
           continue;
+        }
+        // GUARDIA cartella (2026-11-05): il modello a volte chiude con FINAL_ANSWER senza aver letto i file (e inventa il contenuto)
+        // o dice "procederò con la modifica" senza chiamare fs_propose_edit. Si rimanda indietro UNA volta per caso
+        // (lo stato si ricava dai passi già fatti, quindi vale anche dopo le riprese del browser).
+        if (folderMode && parsed.finalAnswer && step < FOLDER_MAX_STEPS - 1) {
+          const _asst = reactMessages.filter(m => m.role === 'assistant').map(m => String(m.content)).join('\n');
+          const _readDone = /ACTION:\s*fs_(read|search)\b/.test(_asst);
+          const _editDone = /ACTION:\s*fs_propose_edit\b/.test(_asst);
+          const _bounced = (mk) => reactMessages.some(m => m.role === 'user' && String(m.content).indexOf(mk) !== -1);
+          const _wantsEdit = /\b(aggiung\w*|modific\w*|cambia\w*|sostitu\w*|correggi\w*|inserisci\w*|scrivi\w*|crea\w*|rimuovi\w*|togli\w*|aggiorna\w*)\b/i.test(userText);
+          const _overview = /(cosa\s+c'?\s*è|cosa\s+contiene|elenc\w*|struttura|che\s+file|quali\s+file|what'?s\s+in|list\b)/i.test(userText);
+          if (_wantsEdit && !_editDone && !_bounced('[GUARDIA-MODIFICA]')) {
+            reactMessages.push({ role: 'assistant', content: stepText });
+            reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-MODIFICA] Non hai chiamato fs_propose_edit, quindi nessuna modifica è stata proposta. Se l\'utente chiede di cambiare, aggiungere o creare qualcosa in un file: se non l\'hai già fatto leggi il file con fs_read, poi chiama fs_propose_edit nel formato esatto (percorso, <<<VECCHIO, testo copiato identico, <<<NUOVO, testo nuovo, <<<FINE). Se invece la richiesta non è una modifica, rispondi di nuovo con FINAL_ANSWER.' });
+            continue;
+          }
+          if (!_readDone && !_overview && !_wantsEdit && !_bounced('[GUARDIA-LETTURA]')) {
+            reactMessages.push({ role: 'assistant', content: stepText });
+            reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-LETTURA] Non hai letto nessun file in questa conversazione: non puoi descriverne il contenuto. Leggi ora i file pertinenti con fs_read (o cerca con fs_search) e poi rispondi. Se la domanda non riguarda il contenuto dei file, rispondi di nuovo con FINAL_ANSWER.' });
+            continue;
+          }
         }
         if (parsed.finalAnswer) {
           if (parsed.truncated && !truncationRetried) {
