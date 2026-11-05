@@ -251,6 +251,14 @@ const MAX_REACT_STEPS = 8;
 const FOLDER_MAX_STEPS = 12;
 const FOLDER_CLIENT_TOOLS = /^fs_(list|read|search|propose_edit)$/;
 const FOLDER_SERVER_TOOLS = new Set(['get_current_datetime', 'calculate']);
+const FOLDER_STOP = new Set(['funziona','funzionano','questo','questa','quello','quella','cartella','progetto','spiegami','spiega','spiegare','dimmi','leggi','leggere','aggiungi','aggiungere','modifica','modificare','crea','creare','sopra','sotto','euro','quale','quali','dentro','questi','queste','nella','nello','della','delle','degli','alcuni','files','codice','funzione','programma','correggi','cambia','scrivi','serve','fanno','fatto','voglio','vorrei','puoi','potresti','perche','quando','prova','ainstain','tutto','tutti','sempre','ancora','anche','molto','poco']);
+function folderKeyword(t) {
+  const w = String(t || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/[^a-z0-9]+/).filter(x => x.length >= 5 && !FOLDER_STOP.has(x) && !/^\d+$/.test(x));
+  if (!w.length) return '';
+  w.sort((a, b) => b.length - a.length);
+  const k = w[0];
+  return k.length >= 6 ? k.slice(0, 5) : k;   // radice: "sconto" e "scontato" trovano entrambe "scont"
+}
 function cleanResumeSteps(raw) {
   const out = [];
   if (!Array.isArray(raw)) return out;
@@ -1873,6 +1881,16 @@ async function handlerCore(req) {
       for (let step = _startStep; step <= _maxSteps; step++) {
         // Timeout di sicurezza (2026-10-11): oltre 40s si smette di cercare e si passa alla sintesi con quanto raccolto.
         if (Date.now() - _agentStartedAt > 40000) { console.log('[AI] Agente: timeout 40s, passo alla sintesi'); break; }
+        // Cartella (5 nov): prima ricerca forzata sulla parola chiave della domanda. Senza, il modello legge a caso (es. solo
+        // nota.txt) e inventa il resto. I risultati dicono in quali file sta l'argomento, anche nelle sottocartelle.
+        if (folderMode && !folderResume && step === _startStep && !(/(cosa\s+c'?\s*è|cosa\s+contiene|elenc\w*|struttura|che\s+file|quali\s+file)/i.test(userText))) {
+          const _kw = folderKeyword(userText);
+          if (_kw) {
+            send({ type: 'agent_client_tool', tool: 'fs_search', input: _kw, next_step: step + 1,
+                   steps: reactMessages.slice(_stepsBase).concat([{ role: 'assistant', content: 'THOUGHT: cerco nella cartella i file che parlano dell\'argomento.\nACTION: fs_search\nACTION_INPUT: ' + _kw }]) });
+            return;
+          }
+        }
         send({ type: 'agent_step', step, max: _maxSteps });
 
         let stepText;
@@ -1944,6 +1962,22 @@ async function handlerCore(req) {
             if (_unread.length && !_blocked) {
               reactMessages.push({ role: 'assistant', content: stepText });
               reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-CITATI] Nella risposta o nella domanda compaiono file che NON hai letto con fs_read: ' + _unread.slice(0, 4).join(', ') + '. Non puoi descriverne il contenuto senza leggerli. Leggili ora con fs_read (usa il percorso completo visto in fs_list; se non lo conosci, usa fs_search o fs_list) e poi rispondi. Se un file non esiste davvero, dillo.' });
+              continue;
+            }
+          }
+          if (!_editDone && !_bounced('[GUARDIA-RISULTATI]')) {
+            const _hits = new Set();
+            for (const m of reactMessages) {
+              if (m.role !== 'user' || String(m.content).indexOf('Risultato di fs_search') === -1) continue;
+              const re2 = /^([^\s:][^:\n]*?):\d+:/gm; let mm;
+              while ((mm = re2.exec(String(m.content))) !== null) _hits.add(mm[1].trim());
+            }
+            const _rs2 = new Set(); const _rr2 = /ACTION:\s*fs_read\s*\n\s*ACTION_INPUT:\s*([^\n|]+)/g; let _m2;
+            while ((_m2 = _rr2.exec(_asst)) !== null) _rs2.add(_m2[1].trim().replace(/^["'`]+|["'`]+$/g, '').replace(/\\/g, '/').toLowerCase());
+            const _unreadHits = [..._hits].slice(0, 5).filter(h => !_rs2.has(h.replace(/\\/g, '/').toLowerCase()));
+            if (_unreadHits.length) {
+              reactMessages.push({ role: 'assistant', content: stepText });
+              reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-RISULTATI] La ricerca ha trovato l\'argomento in questi file che NON hai ancora letto: ' + _unreadHits.join(', ') + '. Leggili con fs_read (uno alla volta, percorso completo) prima di rispondere: i risultati della ricerca sono solo righe sparse, non il contenuto del file.' });
               continue;
             }
           }
