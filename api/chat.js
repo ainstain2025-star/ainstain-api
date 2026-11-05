@@ -307,6 +307,7 @@ REGOLE:
 7. Hai al massimo ${FOLDER_MAX_STEPS} passi totali: arrivare a un buon FINAL_ANSWER entro il limite è meglio che restare bloccato.
 8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi.
 9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
+10. Se fs_read dà errore "file non trovato", NON concludere che il file o la funzione non esistono: segui il suggerimento del risultato, oppure usa fs_list sulle sottocartelle o fs_search. Dì che qualcosa non esiste solo dopo averlo cercato davvero.
 ---`;
 }
 
