@@ -313,7 +313,7 @@ REGOLE:
 5. Alcuni file sensibili (chiavi, password, file .env) sono bloccati e non si possono leggere: se il risultato lo dice, riferiscilo e prosegui senza.
 6. Usa uno strumento alla volta e aspetta sempre il risultato prima di continuare. Se un'azione identica non ti ha aiutato, non ripeterla: rispondi con quello che sai.
 7. Hai al massimo ${FOLDER_MAX_STEPS} passi totali: arrivare a un buon FINAL_ANSWER entro il limite è meglio che restare bloccato.
-8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi. Un file che citi nella risposta lo devi aver letto: aver letto nota.txt non permette di descrivere sconto.js.
+8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi. Un file che citi nella risposta lo devi aver letto: aver letto nota.txt non permette di descrivere sconto.js. Se riporti il codice di un file, copialo IDENTICO: mai sostituire parti con commenti, puntini o TODO.
 9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
 10. Se fs_read dà errore "file non trovato", NON concludere che il file o la funzione non esistono: segui il suggerimento del risultato, oppure usa fs_list sulle sottocartelle o fs_search. Dì che qualcosa non esiste solo dopo averlo cercato davvero.
 ---`;
@@ -1963,6 +1963,27 @@ async function handlerCore(req) {
               reactMessages.push({ role: 'assistant', content: stepText });
               reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-CITATI] Nella risposta o nella domanda compaiono file che NON hai letto con fs_read: ' + _unread.slice(0, 4).join(', ') + '. Non puoi descriverne il contenuto senza leggerli. Leggili ora con fs_read (usa il percorso completo visto in fs_list; se non lo conosci, usa fs_search o fs_list) e poi rispondi. Se un file non esiste davvero, dillo.' });
               continue;
+            }
+          }
+          // codice mostrato nella risposta che non coincide con i file letti (caso reale 5 nov: sconto.js riscritto con un TODO)
+          if (!_wantsEdit && !_bounced('[GUARDIA-CITAZIONI]')) {
+            const _obs = reactMessages.filter(m => m.role === 'user' && String(m.content).indexOf('Risultato di fs_read') !== -1).map(m => String(m.content)).join('\n');
+            if (_obs) {
+              const _norm = (x) => String(x).replace(/\s+/g, ' ').trim();
+              const _obsN = _norm(_obs);
+              const _missing = [];
+              const _cre = /```[\w+-]*\n([\s\S]*?)```/g; let _cm;
+              while ((_cm = _cre.exec(parsed.finalAnswer || '')) !== null) {
+                for (const ln of _cm[1].split('\n')) {
+                  const t = _norm(ln);
+                  if (t.length >= 10 && _obsN.indexOf(t) === -1) _missing.push(t.slice(0, 70));
+                }
+              }
+              if (_missing.length) {
+                reactMessages.push({ role: 'assistant', content: stepText });
+                reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-CITAZIONI] Il codice o testo che mostri in un blocco NON coincide con i file che hai letto: righe non presenti nei file: ' + _missing.slice(0, 3).join(' || ') + '. Se citi il contenuto di un file, copialo IDENTICO da OBSERVATION, senza sostituire parti con commenti o TODO. Se invece è una tua proposta, scrivilo chiaramente come proposta, non come contenuto del file. Rispondi di nuovo con FINAL_ANSWER.' });
+                continue;
+              }
             }
           }
           if (!_editDone && !_bounced('[GUARDIA-RISULTATI]')) {
