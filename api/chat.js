@@ -305,7 +305,7 @@ REGOLE:
 5. Alcuni file sensibili (chiavi, password, file .env) sono bloccati e non si possono leggere: se il risultato lo dice, riferiscilo e prosegui senza.
 6. Usa uno strumento alla volta e aspetta sempre il risultato prima di continuare. Se un'azione identica non ti ha aiutato, non ripeterla: rispondi con quello che sai.
 7. Hai al massimo ${FOLDER_MAX_STEPS} passi totali: arrivare a un buon FINAL_ANSWER entro il limite è meglio che restare bloccato.
-8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi.
+8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi. Un file che citi nella risposta lo devi aver letto: aver letto nota.txt non permette di descrivere sconto.js.
 9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
 10. Se fs_read dà errore "file non trovato", NON concludere che il file o la funzione non esistono: segui il suggerimento del risultato, oppure usa fs_list sulle sottocartelle o fs_search. Dì che qualcosa non esiste solo dopo averlo cercato davvero.
 ---`;
@@ -1929,6 +1929,23 @@ async function handlerCore(req) {
             reactMessages.push({ role: 'assistant', content: stepText });
             reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-MODIFICA] Non hai chiamato fs_propose_edit, quindi nessuna modifica è stata proposta. Se l\'utente chiede di cambiare, aggiungere o creare qualcosa in un file: se non l\'hai già fatto leggi il file con fs_read, poi chiama fs_propose_edit nel formato esatto (percorso, <<<VECCHIO, testo copiato identico, <<<NUOVO, testo nuovo, <<<FINE). Se invece la richiesta non è una modifica, rispondi di nuovo con FINAL_ANSWER.' });
             continue;
+          }
+          // file citati nella risposta (o nella domanda) ma mai letti con fs_read: caso reale 5 nov, ha letto solo nota.txt
+          // e ha descritto src/sconto.js inventandolo.
+          if (!_wantsEdit && !_bounced('[GUARDIA-CITATI]')) {
+            const _fre = /[\w.\-\/]+\.(?:js|mjs|cjs|ts|tsx|jsx|json|md|txt|html|css|py|php|java|c|cpp|cs|go|rs|sh|bat|sql|yml|yaml|toml|ini|xml|csv)\b/gi;
+            const _base = (x) => String(x).split('/').pop().toLowerCase();
+            const _readSet = new Set();
+            const _rre = /ACTION:\s*fs_read\s*\n\s*ACTION_INPUT:\s*([^\n|]+)/g; let _m;
+            while ((_m = _rre.exec(_asst)) !== null) _readSet.add(_base(_m[1].trim().replace(/^["'`]+|["'`]+$/g, '')));
+            const _cited = [...new Set(((parsed.finalAnswer || '') + ' ' + userText).match(_fre) || [])].map(_base).filter(n => !/^\.env/.test(n));
+            const _unread = _cited.filter(n => !_readSet.has(n));
+            const _blocked = /bloccat|sensibil/i.test(parsed.finalAnswer || '');
+            if (_unread.length && !_blocked) {
+              reactMessages.push({ role: 'assistant', content: stepText });
+              reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-CITATI] Nella risposta o nella domanda compaiono file che NON hai letto con fs_read: ' + _unread.slice(0, 4).join(', ') + '. Non puoi descriverne il contenuto senza leggerli. Leggili ora con fs_read (usa il percorso completo visto in fs_list; se non lo conosci, usa fs_search o fs_list) e poi rispondi. Se un file non esiste davvero, dillo.' });
+              continue;
+            }
           }
           if (!_readDone && !_overview && !_wantsEdit && !_bounced('[GUARDIA-LETTURA]')) {
             reactMessages.push({ role: 'assistant', content: stepText });
