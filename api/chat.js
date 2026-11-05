@@ -1955,7 +1955,7 @@ async function handlerCore(req) {
             const _base = (x) => String(x).split('/').pop().toLowerCase();
             const _readSet = new Set();
             const _rre = /ACTION:\s*fs_read\s*\n\s*ACTION_INPUT:\s*([^\n|]+)/g; let _m;
-            while ((_m = _rre.exec(_asst)) !== null) _readSet.add(_base(_m[1].trim().replace(/^["'`]+|["'`]+$/g, '')));
+            while ((_m = _rre.exec(_asst)) !== null) _readSet.add(_base(_m[1].trim().replace(/[\s<>`"']+$/g, '').replace(/^["'`]+/, '')));
             const _cited = [...new Set(((parsed.finalAnswer || '') + ' ' + userText).match(_fre) || [])].map(_base).filter(n => !/^\.env/.test(n));
             const _unread = _cited.filter(n => !_readSet.has(n));
             const _blocked = /bloccat|sensibil/i.test(parsed.finalAnswer || '');
@@ -1973,7 +1973,7 @@ async function handlerCore(req) {
               while ((mm = re2.exec(String(m.content))) !== null) _hits.add(mm[1].trim());
             }
             const _rs2 = new Set(); const _rr2 = /ACTION:\s*fs_read\s*\n\s*ACTION_INPUT:\s*([^\n|]+)/g; let _m2;
-            while ((_m2 = _rr2.exec(_asst)) !== null) _rs2.add(_m2[1].trim().replace(/^["'`]+|["'`]+$/g, '').replace(/\\/g, '/').toLowerCase());
+            while ((_m2 = _rr2.exec(_asst)) !== null) _rs2.add(_m2[1].trim().replace(/[\s<>`"']+$/g, '').replace(/^["'`]+/, '').replace(/\\/g, '/').toLowerCase());
             const _unreadHits = [..._hits].slice(0, 5).filter(h => !_rs2.has(h.replace(/\\/g, '/').toLowerCase()));
             if (_unreadHits.length) {
               reactMessages.push({ role: 'assistant', content: stepText });
