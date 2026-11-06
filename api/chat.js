@@ -254,6 +254,8 @@ const FOLDER_MAX_STEPS = 12;
 const FOLDER_MODEL = process.env.FOLDER_MODEL || 'llama-3.3-70b-versatile';
 // Riserve per la cartella: i file dell'utente escono SOLO verso motori con condizioni sui dati accettabili (Groq, Cloudflare con
 // "zero data retention", OpenRouter come per i documenti). SambaNova, Mistral e Gemini (piani gratuiti che possono addestrare sui contenuti) sono esclusi.
+// Intento di modifica nell'ULTIMO messaggio dell'utente (un "Da fare" scritto dentro un file non conta come richiesta).
+const FOLDER_EDIT_RE = /\b(aggiung\w*|modific\w*|cambia\w*|sostitu\w*|correg\w*|inserisc\w*|scriv\w*|cre[aio]\w*|rimuov\w*|tog[lg]\w*|aggiorn\w*|implement\w*|sistem\w*|riscriv\w*|rinomin\w*|applica\w*|proponi\w*|add|change|edit|fix|update|create|write|remove|replace)\b/i;
 const FOLDER_ALLOWED = new Set(['Groq', 'Cloudflare', 'OpenRouter']);
 const FOLDER_CF_MODEL = process.env.FOLDER_CF_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 function folderProviders(all) {
@@ -324,7 +326,7 @@ REGOLE:
 6. Usa uno strumento alla volta e aspetta sempre il risultato prima di continuare. Se un'azione identica non ti ha aiutato, non ripeterla: rispondi con quello che sai.
 7. Hai al massimo ${FOLDER_MAX_STEPS} passi totali: arrivare a un buon FINAL_ANSWER entro il limite è meglio che restare bloccato.
 8. Descrivi o spiega il contenuto di un file SOLO dopo averlo letto con fs_read in questa conversazione. Un elenco di file (fs_list) mostra solo i nomi: non basta per dire cosa c'è dentro. Non inventare funzioni, formule o esempi. Un file che citi nella risposta lo devi aver letto: aver letto nota.txt non permette di descrivere sconto.js. Se riporti il codice di un file, copialo IDENTICO: mai sostituire parti con commenti, puntini o TODO.
-9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
+9. Se l'utente chiede di aggiungere, cambiare, correggere o creare qualcosa in un file, devi CHIAMARE fs_propose_edit (dopo aver letto il file con fs_read). Proponi modifiche SOLO se l'ULTIMO messaggio dell'utente le chiede esplicitamente: una domanda ("come funziona…", "cosa fa…") vuole una spiegazione, non una modifica, e un "Da fare" scritto in un file non è una richiesta. Non scrivere mai in FINAL_ANSWER frasi come "procederò" o "ora propongo": o chiami lo strumento, oppure spieghi perché non puoi.
 10. Se fs_read dà errore "file non trovato", NON concludere che il file o la funzione non esistono: segui il suggerimento del risultato, oppure usa fs_list sulle sottocartelle o fs_search. Dì che qualcosa non esiste solo dopo averlo cercato davvero.
 ---`;
 }
@@ -1951,7 +1953,7 @@ async function handlerCore(req) {
           const _readDone = /ACTION:\s*fs_(read|search)\b/.test(_asst);
           const _editDone = /ACTION:\s*fs_propose_edit\b/.test(_asst);
           const _bounced = (mk) => reactMessages.some(m => m.role === 'user' && String(m.content).indexOf(mk) !== -1);
-          const _wantsEdit = /\b(aggiung\w*|modific\w*|cambia\w*|sostitu\w*|correggi\w*|inserisci\w*|scrivi\w*|crea\w*|rimuovi\w*|togli\w*|aggiorna\w*)\b/i.test(userText);
+          const _wantsEdit = FOLDER_EDIT_RE.test(userText);
           const _overview = /(cosa\s+c'?\s*è|cosa\s+contiene|elenc\w*|struttura|che\s+file|quali\s+file|what'?s\s+in|list\b)/i.test(userText);
           if (_wantsEdit && !_editDone && !_bounced('[GUARDIA-MODIFICA]')) {
             reactMessages.push({ role: 'assistant', content: stepText });
@@ -2043,6 +2045,11 @@ async function handlerCore(req) {
         // Modalità cartella (2026-11-01): gli strumenti fs_* li esegue il browser dell'utente. Il server passa la mano
         // (con tutti i passi fatti finora) e chiude lo stream; il browser rimanda tutto con agentResume.
         if (folderMode && parsed.action) {
+          if (parsed.action === 'fs_propose_edit' && !FOLDER_EDIT_RE.test(userText)) {
+            reactMessages.push({ role: 'assistant', content: stepText });
+            reactMessages.push({ role: 'user', content: 'OBSERVATION: L\'utente NON ha chiesto di modificare nulla: non proporre modifiche. Un "Da fare" o un TODO scritto in un file non è una richiesta dell\'utente. Rispondi alla sua domanda con FINAL_ANSWER, basandoti sui file letti.' });
+            continue;
+          }
           if (FOLDER_CLIENT_TOOLS.test(parsed.action)) {
             send({ type: 'agent_client_tool', tool: parsed.action, input: String(parsed.actionInput || '').slice(0, parsed.action === 'fs_propose_edit' ? 8000 : 500), next_step: step + 1,
                    steps: reactMessages.slice(_stepsBase).concat([{ role: 'assistant', content: stepText }]) });
