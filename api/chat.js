@@ -249,6 +249,9 @@ const MAX_REACT_STEPS = 8;
 // il loop quando il browser rimanda il risultato (agentResume). Strumenti web spenti: un file ostile non
 // deve poter far uscire dati dell'utente con una ricerca o con l'apertura di un indirizzo.
 const FOLDER_MAX_STEPS = 12;
+// Modello di Groq per la modalità cartella (6 nov 2026): gpt-oss-120b inventava il contenuto dei file e ignorava i richiami; Llama 3.3 70B
+// segue meglio il formato a passi e ha un serbatoio di quota separato. Cambiabile da Vercel con FOLDER_MODEL senza nuovo deploy del codice.
+const FOLDER_MODEL = process.env.FOLDER_MODEL || 'llama-3.3-70b-versatile';
 const FOLDER_CLIENT_TOOLS = /^fs_(list|read|search|propose_edit)$/;
 const FOLDER_SERVER_TOOLS = new Set(['get_current_datetime', 'calculate']);
 const FOLDER_STOP = new Set(['funziona','funzionano','questo','questa','quello','quella','cartella','progetto','spiegami','spiega','spiegare','dimmi','leggi','leggere','aggiungi','aggiungere','modifica','modificare','crea','creare','sopra','sotto','euro','quale','quali','dentro','questi','queste','nella','nello','della','delle','degli','alcuni','files','codice','funzione','programma','correggi','cambia','scrivi','serve','fanno','fatto','voglio','vorrei','puoi','potresti','perche','quando','prova','ainstain','tutto','tutti','sempre','ancora','anche','molto','poco']);
@@ -1895,7 +1898,7 @@ async function handlerCore(req) {
 
         let stepText;
         try {
-          const r = await callWithFallback(providers, reactMessages, 1100, 0.3, model);
+          const r = await callWithFallback(providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
           stepText = r.text;
           lastModelUsed = r.model; lastProviderUsed = r.provider;
         } catch (e) {
@@ -1910,7 +1913,7 @@ async function handlerCore(req) {
           // pochi secondi, trova provider liberi e risolve da solo.
           console.log('[AI] Agente: passo fallito su entrambi i provider (' + e.message + '), ritento una volta...');
           try {
-            const r2 = await callWithFallback(providers, reactMessages, 1100, 0.3, model);
+            const r2 = await callWithFallback(providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
             stepText = r2.text;
             lastModelUsed = r2.model; lastProviderUsed = r2.provider;
           } catch (e2) {
@@ -2142,7 +2145,7 @@ async function handlerCore(req) {
             { role: 'system', content: baseSystemPrompt + '\n\nHai ragionato più volte su questa richiesta senza arrivare a una conclusione netta. Dai ORA la tua migliore risposta possibile all\'utente, SEMPRE E SOLO nella stessa lingua dell\'ultimo messaggio dell\'utente (italiano solo se la lingua non è chiara) (qualunque sia la lingua che hai usato nel ragionamento interno), usando tutto il ragionamento fatto finora. Non ripetere il formato THOUGHT/ACTION: scrivi direttamente la risposta finale come faresti normalmente in una chat. IMPORTANTE: se la domanda richiede un fatto concreto (data, prezzo, notizia, risultato) che non hai davvero recuperato in nessuna Observation qui sopra, dillo chiaramente, nella stessa lingua dell\'utente, invece di inventarlo — meglio ammettere di non aver trovato l\'informazione che darne una falsa.' },
             ...reactMessages.filter(m => m.role !== 'system')
           ];
-          const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, model);
+          const synthResult = await callWithFallback(providers, synthesisMessages, maxTokens, temperature, folderMode ? FOLDER_MODEL : model);
           finalAnswer = synthResult.text;
           lastModelUsed = synthResult.model; lastProviderUsed = synthResult.provider;
         } catch (e) {
