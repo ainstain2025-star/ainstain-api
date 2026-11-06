@@ -249,9 +249,10 @@ const MAX_REACT_STEPS = 8;
 // il loop quando il browser rimanda il risultato (agentResume). Strumenti web spenti: un file ostile non
 // deve poter far uscire dati dell'utente con una ricerca o con l'apertura di un indirizzo.
 const FOLDER_MAX_STEPS = 12;
+// 6 nov 23:05: llama-3.3-70b-versatile NON esiste per questo account Groq (log: "does not exist or you do not have access") e il server ripiegava in silenzio su gpt-oss. Ora qwen3.8-27b.
 // Modello di Groq per la modalità cartella (6 nov 2026): gpt-oss-120b inventava il contenuto dei file e ignorava i richiami; Llama 3.3 70B
 // segue meglio il formato a passi e ha un serbatoio di quota separato. Cambiabile da Vercel con FOLDER_MODEL senza nuovo deploy del codice.
-const FOLDER_MODEL = process.env.FOLDER_MODEL || 'llama-3.3-70b-versatile';
+const FOLDER_MODEL = process.env.FOLDER_MODEL || 'qwen/qwen3.8-27b';
 // Riserve per la cartella: i file dell'utente escono SOLO verso motori con condizioni sui dati accettabili (Groq, Cloudflare con
 // "zero data retention", OpenRouter come per i documenti). SambaNova, Mistral e Gemini (piani gratuiti che possono addestrare sui contenuti) sono esclusi.
 // Intento di modifica nell'ULTIMO messaggio dell'utente (un "Da fare" scritto dentro un file non conta come richiesta).
