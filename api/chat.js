@@ -1986,7 +1986,9 @@ async function handlerCore(req) {
               }
             }
           }
-          if (!_editDone && !_bounced('[GUARDIA-RISULTATI]')) {
+          if (!_editDone) {
+            // Il modello gratuito ignora i richiami: i file trovati dalla ricerca e non ancora letti li fa leggere il server stesso
+            // (un passo per file, al massimo 4), poi il modello risponde con il contenuto vero davanti.
             const _hits = new Set();
             for (const m of reactMessages) {
               if (m.role !== 'user' || String(m.content).indexOf('Risultato di fs_search') === -1) continue;
@@ -1995,11 +1997,12 @@ async function handlerCore(req) {
             }
             const _rs2 = new Set(); const _rr2 = /ACTION:\s*fs_read\s*\n\s*ACTION_INPUT:\s*([^\n|]+)/g; let _m2;
             while ((_m2 = _rr2.exec(_asst)) !== null) _rs2.add(_m2[1].trim().replace(/[\s<>`"']+$/g, '').replace(/^["'`]+/, '').replace(/\\/g, '/').toLowerCase());
-            const _unreadHits = [..._hits].slice(0, 5).filter(h => !_rs2.has(h.replace(/\\/g, '/').toLowerCase()));
+            const _unreadHits = [..._hits].slice(0, 4).filter(h => !_rs2.has(h.replace(/\\/g, '/').toLowerCase()));
             if (_unreadHits.length) {
-              reactMessages.push({ role: 'assistant', content: stepText });
-              reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-RISULTATI] La ricerca ha trovato l\'argomento in questi file che NON hai ancora letto: ' + _unreadHits.join(', ') + '. Leggili con fs_read (uno alla volta, percorso completo) prima di rispondere: i risultati della ricerca sono solo righe sparse, non il contenuto del file.' });
-              continue;
+              const _path = _unreadHits[0];
+              send({ type: 'agent_client_tool', tool: 'fs_read', input: _path, next_step: step + 1,
+                     steps: reactMessages.slice(_stepsBase).concat([{ role: 'assistant', content: 'THOUGHT: leggo il file trovato dalla ricerca prima di rispondere.\nACTION: fs_read\nACTION_INPUT: ' + _path }]) });
+              return;
             }
           }
           if (!_readDone && !_overview && !_wantsEdit && !_bounced('[GUARDIA-LETTURA]')) {
