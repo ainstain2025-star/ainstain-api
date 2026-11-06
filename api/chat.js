@@ -963,7 +963,18 @@ async function bumpDaily(key, ttl) {
 }
 function dayKey() { return new Date().toISOString().slice(0, 10); }
 
+// Avviso per il badge del modello (6 nov 2026): verde = ha risposto il modello richiesto, giallo = ha risposto una riserva.
+function buildAlert(r) {
+  if (!r || !r.want) return null;
+  const wantModel = (MODEL_ALIASES[r.want.model] || r.want.model);
+  const degraded = r.provider !== r.want.provider || (r.model !== r.want.model && r.model !== wantModel);
+  if (!degraded) return { level: 'ok' };
+  const why = (r.why && r.why.length) ? r.why.join('; ') : 'modello richiesto non disponibile';
+  return { level: 'warn', msg: ('Richiesto ' + r.want.model + ' (' + r.want.provider + ') — ' + why + '. Ha risposto ' + r.model + ' (' + r.provider + ').').slice(0, 300) };
+}
 async function callWithFallback(providers, messages, maxTokens, temperature, model) {
+  const why = [];
+  const want = { provider: providers[0] && providers[0].name, model: model || (providers[0] && providers[0].model) };
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato: account bloccato'); continue; }
@@ -988,7 +999,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
         body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: false, ...(p.extraBody || {}) }),
         signal: AbortSignal.timeout(25000),
       });
-      if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
+      if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); why.push(p.name + ' sovraccarico (' + res.status + ')'); continue; }
       if (!res.ok) {
         // FIX 2026-08-29: prima si loggava il corpo JSON grezzo dell'errore
         // dentro il messaggio — Vercel lo visualizza come testo con
@@ -1024,11 +1035,12 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
               const retryText = retryData.choices?.[0]?.message?.content || '';
               if (!looksLikeInvalidCompletion(retryText)) {
                 console.log('[AI] auto-riparazione riuscita con "' + retryModel + '"');
-                return { text: retryText, provider: p.name, model: retryModel };
+                return { text: retryText, provider: p.name, model: retryModel, want, why: why.concat('modello ' + useModel + ' non disponibile') };
               }
             }
           }
         }
+        why.push(p.name + ': ' + String(readableMsg).slice(0, 90));
         throw new Error(p.name + ' error ' + res.status + ': ' + readableMsg);
       }
       const data = await res.json();
@@ -1056,15 +1068,16 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
               const retryText2 = retryData2.choices?.[0]?.message?.content || '';
               if (!looksLikeInvalidCompletion(retryText2)) {
                 console.log('[AI] ' + p.name + ' secondo tentativo riuscito');
-                return { text: retryText2, provider: p.name, model: useModel };
+                return { text: retryText2, provider: p.name, model: useModel, want, why };
               }
             }
           } catch {}
         }
+        why.push(p.name + ': risposta non valida');
         continue;
       }
       console.log('[AI] callWithFallback: used ' + p.name);
-      return { text, provider: p.name, model: useModel };
+      return { text, provider: p.name, model: useModel, want, why };
     } catch(e) {
       if (e.message.includes('429')) { continue; }
       console.log('[AI] ' + p.name + ' error: ' + e.message);
@@ -1882,7 +1895,7 @@ async function handlerCore(req) {
       let lastActionSignature = null;
       let truncationRetried = false;
       let garbledRetries = 0;
-      let lastModelUsed = null, lastProviderUsed = null;
+      let lastModelUsed = null, lastProviderUsed = null, lastR = null;
 
       // FIX 2026-09-19: bug reale trovato in test utente — per domande su
       // notizie/prezzi/eventi recenti l'Agente a volte rispondeva SENZA MAI
@@ -1942,7 +1955,7 @@ async function handlerCore(req) {
         try {
           const r = await callWithFallback(folderMode ? folderProviders(providers) : providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
           stepText = r.text;
-          lastModelUsed = r.model; lastProviderUsed = r.provider;
+          lastModelUsed = r.model; lastProviderUsed = r.provider; lastR = r;
         } catch (e) {
           // FIX 2026-09-19: trovato nei log — Groq e OpenRouter possono
           // fallire ENTRAMBI nello stesso istante (Groq per il tetto TPM,
@@ -1957,7 +1970,7 @@ async function handlerCore(req) {
           try {
             const r2 = await callWithFallback(folderMode ? folderProviders(providers) : providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
             stepText = r2.text;
-            lastModelUsed = r2.model; lastProviderUsed = r2.provider;
+            lastModelUsed = r2.model; lastProviderUsed = r2.provider; lastR = r2;
           } catch (e2) {
             send({ type: 'error', message: '⏳ I server AI gratuiti (Groq/OpenRouter) sono momentaneamente sovraccarichi — ho già ritentato automaticamente senza successo. Riprova tra qualche secondo.', overloaded: true });
             return;
@@ -2206,14 +2219,14 @@ async function handlerCore(req) {
           ];
           const synthResult = await callWithFallback(folderMode ? folderProviders(providers) : providers, synthesisMessages, maxTokens, temperature, folderMode ? FOLDER_MODEL : model);
           finalAnswer = synthResult.text;
-          lastModelUsed = synthResult.model; lastProviderUsed = synthResult.provider;
+          lastModelUsed = synthResult.model; lastProviderUsed = synthResult.provider; lastR = synthResult;
         } catch (e) {
           finalAnswer = '⚠️ Ho ragionato a lungo su questa richiesta senza arrivare a una conclusione netta. Prova a riformulare la richiesta in modo più specifico, o disattiva la modalità Agente per una risposta diretta.';
         }
       }
 
       checkDateConsistency(finalAnswer, WEB_TRIGGERS.some(re => re.test(userText)));
-      send({ type: 'meta', webSearchUsed: usedWeb, model: lastModelUsed, provider: lastProviderUsed });
+      send({ type: 'meta', webSearchUsed: usedWeb, model: lastModelUsed, provider: lastProviderUsed, alert: buildAlert(lastR) });
       for (let i = 0; i < finalAnswer.length; i += 4) send({ type: 'token', token: finalAnswer.slice(i, i + 4) });
       send({ type: 'done' });
     });
