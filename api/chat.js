@@ -1933,7 +1933,7 @@ async function handlerCore(req) {
       let mapGuardUsed = false;
       let mapShown = folderMode, mapNudges = 0;   // con la cartella niente mappe (il test «dov'è…» non deve forzare show_map)
       const MAP_REQ_RE = /\b(cartin[ae]|mapp[ae]|carta\s+geografic\w*|atlante|maps?|atlas)\b|dov['’]\s*[èe]'?(?![a-z])|dove\s+(?:si\s+trova|è)(?![a-z])|where\s+is\b/i;
-      const MAP_NOT_GEO_RE = /(mapp[ae]\s+(?:mental\w*|concettual\w*|del\s+sito|di\s+calore|dei\s+processi)|mind\s*map|heat\s*map|sitemap)/i;
+      const MAP_NOT_GEO_RE = /(mapp[ae]\s+(?:mental\w*|concettual\w*|del\s+sito|di\s+calore|dei\s+processi)|mind\s*map|heat\s*map|sitemap)|\b(traduc\w*|traduzion\w*|tradur\w*|translat\w*)\b/i;
       const FACTUAL_IMG_RE = /\b(cartin[ae]|carta\s+geografic\w*|mapp[ae]|planimetri\w*|piantin\w*|atlant\w*|maps?|atlas|floor\s*plan|flag|bandier\w*|grafico\s+(?:dei|del|di)\s+dat\w*)\b/i;
       const ILLUSTRATION_RE = /(disegn\w*|illustra\w*|dipingi\w*|fantasy|immaginari\w*|inventat\w*|acquerell\w*|fumetto|cartoon|stile\s|draw|paint|illustrat\w*|fictional)/i;
       for (let step = _startStep; step <= _maxSteps; step++) {
@@ -2121,6 +2121,12 @@ async function handlerCore(req) {
         }
 
         // show_map (2026-10-12): geocodifica lato server, la mappa vera la disegna il browser (Leaflet + OpenStreetMap)
+        if (parsed.action === 'show_map' && MAP_NOT_GEO_RE.test(userText)) {
+          // 8 nov 2026 (stress test p04): «traduci: dove si trova la stazione?» mostrava la mappa di Roma Termini invece della traduzione
+          reactMessages.push({ role: 'assistant', content: stepText });
+          reactMessages.push({ role: 'user', content: 'OBSERVATION: L\'utente NON ha chiesto una mappa (chiede una traduzione o altro). Non usare show_map: rispondi con FINAL_ANSWER eseguendo la richiesta.' });
+          continue;
+        }
         if (parsed.action === 'show_map') {
           send({ type: 'agent_tools', tools: ['show_map'] });
           const place = await geocodePlace(parsed.actionInput);
