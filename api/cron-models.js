@@ -12,6 +12,24 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj, null, 2), {
   status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' },
 });
 
+async function sendAlertMail(env, report) {
+  const key = env.RESEND_API_KEY;
+  if (!key) return { ok: false, error: 'RESEND_API_KEY mancante' };
+  const to = env.ALERT_EMAIL || 'ainstain2025@gmail.com';
+  const from = env.MAIL_FROM || 'AInstAIn <onboarding@resend.dev>';
+  const icon = report.severity === 'critical' ? '🔴' : '🟡';
+  const li = (report.alerts || []).map(a => '<li>' + String(a).replace(/</g, '&lt;') + '</li>').join('');
+  const ac = (report.actions || []).map(a => '<li>' + String(a).replace(/</g, '&lt;') + '</li>').join('');
+  const html = '<div style="font-family:system-ui,sans-serif;max-width:560px"><h2>' + icon + ' Controllo modelli AInstAIn</h2><p>' + report.summary + '</p>' +
+    (li ? '<h3>Avvisi</h3><ul>' + li + '</ul>' : '') + (ac ? '<h3>Azioni automatiche</h3><ul>' + ac + '</ul>' : '') +
+    '<p><a href="https://ainstain-api.vercel.app/api/models-report">Apri il rapporto completo</a></p></div>';
+  try {
+    const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject: icon + ' AInstAIn: controllo modelli — ' + report.severity, html }) });
+    return { ok: r.ok, status: r.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 export default async function handler(req) {
   const env = process.env;
   const secret = env.CRON_SECRET;
@@ -66,7 +84,16 @@ export default async function handler(req) {
 
   try {
     const report = await runNightlyCheck(deps, { dry });
-    return json({ summary: report.summary, severity: report.severity, actions: report.actions, alerts: report.alerts, dry });
+    // Modello usato in modalità cartella: deve esistere su Groq (altrimenti il fallback sostituisce in silenzio)
+    const fm = env.FOLDER_MODEL || 'qwen/qwen3.8-27b';
+    if (Array.isArray(report.available) && report.available.length && !report.available.includes(fm)) {
+      report.alerts.push('Il modello della modalità cartella "' + fm + '" NON è più disponibile su Groq: la modalità cartella userebbe un modello di riserva.');
+      report.severity = 'critical';
+    }
+    // Avviso via email se c'è qualcosa che non va (non in prova a secco, salvo ?mail=1)
+    let mail = null;
+    if (report.severity !== 'ok' && (!dry || url.searchParams.get('mail') === '1')) mail = await sendAlertMail(env, report);
+    return json({ summary: report.summary, severity: report.severity, actions: report.actions, alerts: report.alerts, dry, mail });
   } catch (e) {
     return json({ error: 'Controllo fallito: ' + e.message }, 500);
   }
