@@ -1088,6 +1088,8 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 
 // ── Streaming con fallback ────────────────────────────────────────────
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
+  const why = [];
+  const want = { provider: providers[0] && providers[0].name, model: model || (providers[0] && providers[0].model) };
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato (stream): account bloccato'); continue; }
@@ -1101,7 +1103,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
         body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true, ...(p.extraBody || {}) }),
       });
-      if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); continue; }
+      if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); why.push(p.name + ' sovraccarico (' + res.status + ')'); continue; }
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
         let readableMsg = errBody.slice(0, 200);
@@ -1190,7 +1192,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
               // 2026-10-19: risposta conclusa senza nemmeno un carattere (es. blocco di sicurezza del provider):
               // si passa al provider successivo invece di lasciare una bolla vuota.
               if (!invalidDetected && !emitted && !pendingText) invalidDetected = true;
-              if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done', { model: useModel, provider: p.name });
+              if (!invalidDetected) onDone(j.choices[0].finish_reason === 'length' ? 'truncated' : 'done', { model: useModel, provider: p.name, want, why });
             }
           } catch {}
           if (invalidDetected) break streamLoop;
@@ -1203,6 +1205,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
       return;
     } catch(e) {
       console.log('[AI] ' + p.name + ' stream error: ' + e.message);
+      why.push(String(e.message).slice(0, 90));
       if (p === providers[providers.length - 1]) throw e;
     }
   }
@@ -2339,7 +2342,7 @@ async function handlerCore(req) {
           cont++; console.log('[AI] risposta troncata: ripresa automatica ' + cont + '/' + maxCont + ' (' + acc.length + ' caratteri finora)');
           continue;
         }
-        send({ type: reason || 'done', model: (info || lastInfo)?.model, provider: (info || lastInfo)?.provider });
+        send({ type: reason || 'done', model: (info || lastInfo)?.model, provider: (info || lastInfo)?.provider, alert: buildAlert(info || lastInfo) });
         break;
       }
     });
