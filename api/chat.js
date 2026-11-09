@@ -1359,6 +1359,9 @@ function ipPlaceNote(req, userText) {
   } catch { return ''; }
 }
 // 8 nov 2026 (stress test p12): per richieste locali senza città («ristoranti», «meteo») la risposta deve dire quale zona è stata usata.
+// 2026-11-09: Vercel restituisce i nomi inglesi ("Naples"): li riportiamo in italiano.
+const CITY_IT = { 'naples':'Napoli','rome':'Roma','milan':'Milano','turin':'Torino','florence':'Firenze','venice':'Venezia','genoa':'Genova','padua':'Padova','mantua':'Mantova','syracuse':'Siracusa','leghorn':'Livorno','bolzano-bozen':'Bolzano','bozen':'Bolzano' };
+const cityIt = (c) => CITY_IT[String(c).toLowerCase()] || c;
 function ipPlaceDisclosure(req, userText, answer) {
   try {
     if (!answer || !LOC_RE.test(userText || '')) return '';
@@ -1366,8 +1369,8 @@ function ipPlaceDisclosure(req, userText, answer) {
     const raw = req.headers.get('x-vercel-ip-city');
     if (!raw) return '';
     const city = decodeURIComponent(raw).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '');
-    if (!city || answer.toLowerCase().indexOf(city.toLowerCase()) !== -1) return '';
-    return '📍 Ho usato la zona di ' + city + ' in base alla tua connessione: se è un\'altra città dimmelo.\n\n';
+    if (!city || answer.toLowerCase().indexOf(city.toLowerCase()) !== -1 || answer.toLowerCase().indexOf(cityIt(city).toLowerCase()) !== -1) return '';
+    return '📍 Ho usato la zona di ' + cityIt(city) + ' in base alla tua connessione: se è un\'altra città dimmelo.\n\n';
   } catch { return ''; }
 }
 // 2026-10-17: richieste locali brevi senza città ("meteo", "ristoranti"): aggiunge la città stimata dalla rete alla query di
@@ -1380,7 +1383,7 @@ function geoEnrich(text, req) {
     const raw = req.headers.get('x-vercel-ip-city');
     if (!raw) return t;
     const city = decodeURIComponent(raw).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '');
-    return city ? (t.trim() + ' ' + city) : t;
+    return city ? (t.trim() + ' ' + cityIt(city)) : t;
   } catch { return text; }
 }
 // 2026-10-17: domande su AInstAIn stessa, sul suo creatore o sulla memoria NON richiedono il web (la ricerca per
