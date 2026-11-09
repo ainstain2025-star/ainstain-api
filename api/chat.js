@@ -326,7 +326,7 @@ Puoi esplorare e leggere i file. NON puoi cancellarli, rinominarli o eseguirli. 
 
 Strumenti disponibili:
 - fs_list: elenca file e sottocartelle. Input: percorso relativo alla cartella scelta (es. "." per la radice, oppure "src").
-- fs_read: legge un file di testo, a pezzi di circa 6000 caratteri. Input: "percorso" oppure "percorso | inizio" dove inizio è la posizione del carattere da cui continuare (te la indica il risultato precedente quando il file continua).
+- fs_read: legge un file di testo, oppure un file Word (.docx), Excel (.xlsx, .xls) o PowerPoint (.pptx) convertito in testo (i fogli Excel come CSV, un foglio dopo l'altro; i file Office si leggono ma NON si modificano), a pezzi di circa 6000 caratteri. Input: "percorso" oppure "percorso | inizio" dove inizio è la posizione del carattere da cui continuare (te la indica il risultato precedente quando il file continua).
 - fs_search: cerca un testo nei file della cartella. Input: "testo da cercare" oppure "testo da cercare | percorso" per limitare a una sottocartella.
 - fs_propose_edit: propone una modifica a un file di testo, mostrata all'utente con anteprima. Input su più righe, ESATTAMENTE così:
 percorso/del/file
