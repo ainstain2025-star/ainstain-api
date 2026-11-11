@@ -2040,6 +2040,14 @@ async function handlerCore(req) {
           const _bounced = (mk) => reactMessages.some(m => m.role === 'user' && String(m.content).indexOf(mk) !== -1);
           const _wantsEdit = FOLDER_EDIT_RE.test(userText) && !_dbWant;
           const _overview = /(cosa\s+c'?\s*è|cosa\s+contiene|elenc\w*|struttura|che\s+file|quali\s+file|what'?s\s+in|list\b)/i.test(userText);
+          // GUARDIA-BLOCCO (2026-11-11): se l'ultimo risultato è «file bloccato» (.env, chiavi, password) la risposta deve dirlo.
+          // Il modello di riserva a volte ignorava l'errore e rispondeva a un'altra domanda (test T17): qui la risposta si sostituisce.
+          {
+            const _lastObs = [...reactMessages].reverse().find(m => m.role === 'user' && String(m.content).indexOf('OBSERVATION') === 0);
+            if (_lastObs && /File bloccato|bloccato: file sensibile|Cartella sensibile|Nome di file non consentito/i.test(String(_lastObs.content)) && !/bloccat|sensibil|chiavi|password/i.test(parsed.finalAnswer || '')) {
+              parsed.finalAnswer = 'Non posso leggere quel file: è bloccato perché potrebbe contenere chiavi o password (file come .env, .pem, id_rsa). Se ti serve aiuto sul suo contenuto, copia qui solo le righe che non sono riservate.';
+            }
+          }
           if (_dbWant && !_dbDone && !_bounced('[GUARDIA-DB]')) {
             reactMessages.push({ role: 'assistant', content: stepText });
             reactMessages.push({ role: 'user', content: 'OBSERVATION: [GUARDIA-DB] Non hai chiamato db_exec né db_import, quindi NESSUN dato è stato salvato. Se l\'utente chiede di salvare, importare o creare dati in un database: se serve leggi prima il file sorgente o lo schema con fs_read, poi chiama db_exec (SQL) o db_import (file Excel/CSV) nel formato esatto. Se invece non c\'è nulla da salvare, rispondi con FINAL_ANSWER spiegando perché, senza dire che hai salvato.' });
