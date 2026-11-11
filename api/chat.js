@@ -2043,7 +2043,7 @@ async function handlerCore(req) {
           // GUARDIA-BLOCCO (2026-11-11): se l'ultimo risultato è «file bloccato» (.env, chiavi, password) la risposta deve dirlo.
           // Il modello di riserva a volte ignorava l'errore e rispondeva a un'altra domanda (test T17): qui la risposta si sostituisce.
           {
-            const _lastObs = [...reactMessages].reverse().find(m => m.role === 'user' && String(m.content).indexOf('OBSERVATION') === 0);
+            const _lastObs = [...reactMessages].reverse().find(m => m.role === 'user' && (String(m.content).indexOf('OBSERVATION') === 0 || String(m.content).indexOf('Risultato di fs_') !== -1));
             if (_lastObs && /File bloccato|bloccato: file sensibile|Cartella sensibile|Nome di file non consentito/i.test(String(_lastObs.content)) && !/bloccat|sensibil|chiavi|password/i.test(parsed.finalAnswer || '')) {
               parsed.finalAnswer = 'Non posso leggere quel file: è bloccato perché potrebbe contenere chiavi o password (file come .env, .pem, id_rsa). Se ti serve aiuto sul suo contenuto, copia qui solo le righe che non sono riservate.';
             }
