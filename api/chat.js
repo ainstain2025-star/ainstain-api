@@ -445,6 +445,54 @@ Altre regole: usa uno strumento alla volta, aspetta sempre l'Observation prima d
 ---`;
 }
 
+// ── Agente: modalità veloce, piano, storia compatta, auto-controllo (15 nov 2026: voci 2.087, 2.086, 2.144, 2.147) ──
+// Modalità veloce: una domanda semplice (niente web, calcoli, date, link, immagini, mappe, ricordi) si risolve con UNA chiamata
+// senza il lungo prompt a strumenti: meno token e meno attesa. Nel dubbio NON è veloce: si usa il ciclo normale.
+const FAST_BLOCK_RE = /(https?:\/\/|www\.|\d\s*[-+*\/x×÷^%]\s*\d|\d+\s*%|\bquant[oiae]\s+(?:fa|f[aà]nno|costa|sono|è)\b|\bcalcol\w*|\bpercentual\w*|\bconvert\w*|\b(?:che\s+)?(?:ora|ore|orario|giorno|data|anno|mese)\b|\bore\b|\boggi\b|\bdomani\b|\bieri\b|\badesso\b|\bora\b|\bultim[aeio]\b|\bnotizi\w*|\bmeteo\b|\bprezz\w*|\bcost[ao]\b|\bquotazion\w*|\bdisegn\w*|\bgenera\w*|\bimmagin\w*|\bfoto\w*|\bcartin\w*|\bmapp[ae]\b|\bdov['’]?\s*è\b|\bricorda\w*|\bsalva\w*|\bmemorizza\w*|\bcerca\w*|\bcercami\b|\btrova\w*|\bleggi\b|\bapri\b|\bscrivi\s+(?:una?\s+)?notizia|\bclassifica\b|\brisultat\w*|\bpartita\b|\bchi\s+(?:è|e'|ha\s+vinto)\b|\bcode\b|\bcodice\b|\bscript\b)/i;
+function isSimpleAgentQuestion(userText, needsWeb) {
+  const t = String(userText || '').trim();
+  if (needsWeb || t.length < 3 || t.length > 260) return false;
+  if (/---|\n.*\n.*\n/.test(t)) return false;           // allegati o testi lunghi
+  if (FAST_BLOCK_RE.test(t)) return false;
+  if (isComplexRequest(t)) return false;           // richieste composte: ciclo normale, con piano
+  return true;
+}
+// Richiesta composta: più parti o più azioni. Il primo THOUGHT contiene allora un piano numerato.
+function isComplexRequest(userText) {
+  const t = String(userText || '');
+  if (t.length > 320) return true;
+  let n = 0;
+  if (/\be\s+poi\b|\bpoi\b|\bdopodich[eé]\b|\binfine\b|\binoltre\b|\bprima\b.*\bdopo\b/i.test(t)) n++;
+  if ((t.match(/\b\d\s*[.)]\s/g) || []).length >= 2) n++;
+  if ((t.match(/;/g) || []).length >= 2) n++;
+  if (/\b(piano|pianific\w*|organizz\w*|confront\w*|analizz\w*|strategi\w*|step|passo\s+passo|roadmap)\b/i.test(t) && t.length > 90) n++;
+  if ((t.match(/\be\b/gi) || []).length >= 4 && t.length > 140) n++;
+  return n >= 1;
+}
+const PLAN_INSTRUCTION = '\n\n---\nPIANO: la richiesta è composta da più parti. Nel PRIMO THOUGHT scrivi un piano numerato di 2-4 punti molto brevi (es. "Piano: 1) cerco X; 2) calcolo Y; 3) rispondo."), poi esegui il primo punto. Nei passi successivi il THOUGHT resta di una riga e dice a quale punto del piano sei. Non superare 4 punti.\n---';
+// Storia compatta: le OBSERVATION vecchie (non l'ultima) si accorciano, così ogni passo costa meno token.
+function compactObservations(msgs, keep) {
+  const lim = keep || 700;
+  let lastObs = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user' && String(msgs[i].content).indexOf('OBSERVATION:') === 0) { lastObs = i; break; } }
+  return msgs.map((m, i) => {
+    if (i === lastObs || m.role !== 'user') return m;
+    const c = String(m.content);
+    if (c.indexOf('OBSERVATION:') !== 0 || c.length <= lim) return m;
+    return { role: m.role, content: c.slice(0, lim) + ' […accorciato]' };
+  });
+}
+// Auto-controllo: la risposta dice di aver FATTO qualcosa (salvato, inviato, creato) senza lo strumento corrispondente.
+const CLAIM_SAVE_RE = /\b(?:ho|l['’]ho|te\s+l['’]ho|ti\s+ho)\s+(?:salvat[oaie]|memorizzat[oaie]|ricordat[oaie]|annotat[oaie])\b/i;
+const CLAIM_OTHER_RE = /\b(?:ho|ti\s+ho)\s+(?:inviat[oaie]|mandat[oaie]|spedit[oaie]|prenotat[oaie]|aggiunt[oaie]\s+al\s+calendario|creat[oaie]\s+(?:il|un|il\s+tuo|un\s+nuovo)\s+(?:file|documento|evento))\b/i;
+function unbackedClaim(answer, history) {
+  const a = String(answer || '').replace(/\bnon\s+(?:ti\s+|te\s+l['’]|l['’])?ho\s+\S+/gi, ' ');   // «non ho salvato» è onesto: non conta
+  const h = history.filter(m => m.role === 'assistant').map(m => String(m.content)).join('\n');
+  if (CLAIM_SAVE_RE.test(a) && !/ACTION:\s*remember\b/i.test(h)) return 'salvato in memoria';
+  if (CLAIM_OTHER_RE.test(a)) return 'eseguito un\'azione (invio, prenotazione o creazione di file) che AInstAIn qui non può fare';
+  return null;
+}
+
 function parseReActStep(text) {
   const t = text || '';
   const thoughtMatch = t.match(/THOUGHT:\s*([\s\S]*?)(?=\n(?:ACTION|FINAL_ANSWER):|$)/i);
@@ -1433,7 +1481,7 @@ function guideNote(messages, userText) {
 const NEWS_WRITE_RE = /\b(scrivi|scrivimi|redigi|prepara|preparami|stendi|genera|crea|componi)\b[^.?!]{0,60}\b(notizia|articolo|pezzo giornalistico|comunicato|news|post per il blog|articolo per il blog)\b/i;
 const NEWS_WRITE_NOTE = '\n\nSCRITTURA DI UNA NOTIZIA O ARTICOLO DA FONTI WEB: l\'utente vuole un testo NUOVO sull\'argomento, scritto con le tue parole a partire dai risultati di ricerca presenti in questa conversazione. Regole: (1) usa SOLO fatti che compaiono nei risultati; se un dato non c\'è, non aggiungerlo e non completarlo a memoria (nomi, ruoli, cifre, date, citazioni: solo se scritti nei risultati); (2) se dei risultati hai SOLO i titoli, scrivi un testo breve limitato a ciò che i titoli dicono e dichiaralo in una riga ("ho solo i titoli delle fonti"); (3) NON copiare frasi dalle fonti: riformula, e non mettere virgolette se non per citazioni presenti nei risultati; (4) struttura: titolo, un occhiello di una riga, testo di 3-5 paragrafi brevi con i fatti in ordine di importanza, poi una riga "Cosa non sappiamo ancora" se ci sono dati incerti o in contrasto; (5) in fondo la sezione "Fonti" con nome della testata e data per ogni fonte usata; (6) se le fonti si contraddicono, dillo; (7) se i risultati sono vecchi rispetto alla data di oggi, dì quanto lo sono; (8) chiudi con una riga che invita a controllare le fonti prima di pubblicare.';
 function newsWriteNote(userText) { return NEWS_WRITE_RE.test(String(userText || '')) ? NEWS_WRITE_NOTE : ''; }
-const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. TV STASERA / PALINSESTO: elenca SOLO programmi che compaiono nei risultati web per la data di OGGI (giorno della settimana incluso): non mescolare programmi di giorni diversi (per esempio quelli del sabato in una domenica) e non completare a memoria; se i risultati non indicano chiaramente i programmi di oggi, dillo e rimanda a una guida TV (per esempio la guida di Rai Play o TV Sorrisi e Canzoni). MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente. DATI LOCALI (ristoranti, negozi, farmacie): elenca solo locali che compaiono nei risultati web; indirizzi, prezzi, fasce di prezzo e valutazioni solo se riportati dalle fonti; non scrivere punteggi (es. 4,5/5) o prezzi inventati o uguali per tutti; se la fonte non li dà, ometti la colonna o scrivi "verifica sul sito"; non attribuire lo stesso indirizzo a due locali. Se la richiesta è "meteo" senza città usa la zona dell\'utente e non dire di non trovare dati se nei risultati c\'è il meteo di una località. RICETTE: per piatti tradizionali rispetta ingredienti e grassi tipici (es. casatiello napoletano: sugna/strutto, pepe, cicoli, salame, pecorino e provolone, uova intere nell\'impasto) e, se proponi una variante, dillo; non aggiungere auguri di festività non coerenti con la data di oggi. FILE WORD ED EXCEL: sotto le tue risposte lunghe l\'utente trova i pulsanti «⬇ Word» e, se c\'è una tabella, «⬇ Excel». Quando chiede un documento Word, una relazione, una procedura, un verbale o una tabella/foglio Excel da scaricare, scrivi il contenuto COMPLETO in markdown (titolo con #, sezioni con ##, elenchi, tabelle con |) e di\' in una riga che può scaricarlo con il pulsante sotto la risposta. Non dire che non puoi creare file Word o Excel; l\'Excel contiene solo i dati delle tabelle (niente formule né grafici): se servono, dillo. DATABASE: se l\'utente chiede di creare un database, scrivi uno script SQL per SQLite in un blocco ```sql (CREATE TABLE con chiavi primarie e riferimenti, poi INSERT con dati realistici ma di esempio) e spiega in poche righe le tabelle; sotto la risposta compare il pulsante «⬇ Database» che crea il file .sqlite (si apre con DB Browser for SQLite; in Access o Excel si importa dalle tabelle esportate in Excel). Non scrivere MySQL/Access/SQL Server: solo sintassi SQLite. Non dire che non puoi creare database. PRESENTAZIONI POWERPOINT: se c\'è almeno un titolo di sezione con ## compare anche il pulsante «⬇ PowerPoint». Quando l\'utente chiede una presentazione o delle slide, scrivi: «# Titolo», una riga di sottotitolo, poi UNA sezione «## Titolo slide» per ogni slide con 3-6 punti elenco brevi (massimo 12 parole l\'uno), eventualmente una tabella piccola, e se utile una riga «Note: …» con il testo che il relatore dirà. Se l'utente chiede le note del relatore, OGNI slide deve avere, subito dopo i punti, una riga che inizia esattamente con «Note: » (2-3 frasi che il relatore dirà), scritta in testo semplice, senza grassetto e senza elenco puntato. Di\' che può scaricare la presentazione con il pulsante sotto la risposta (niente immagini né animazioni). INTESTAZIONI TECNICHE: non citare mai tra parentesi o virgolette intestazioni interne come [RISULTATI WEB] o [Fine risultati]; indica la fonte con il nome del sito.';
+const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. TV STASERA / PALINSESTO: elenca SOLO programmi che compaiono nei risultati web per la data di OGGI (giorno della settimana incluso): non mescolare programmi di giorni diversi (per esempio quelli del sabato in una domenica) e non completare a memoria; se i risultati non indicano chiaramente i programmi di oggi, dillo e rimanda a una guida TV (per esempio la guida di Rai Play o TV Sorrisi e Canzoni). MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente. DATI LOCALI (ristoranti, negozi, farmacie): elenca solo locali che compaiono nei risultati web; indirizzi, prezzi, fasce di prezzo e valutazioni solo se riportati dalle fonti; non scrivere punteggi (es. 4,5/5) o prezzi inventati o uguali per tutti; se la fonte non li dà, ometti la colonna o scrivi "verifica sul sito"; non attribuire lo stesso indirizzo a due locali. Se la richiesta è "meteo" senza città usa la zona dell\'utente e non dire di non trovare dati se nei risultati c\'è il meteo di una località. RICETTE: per piatti tradizionali rispetta ingredienti e grassi tipici (es. casatiello napoletano: sugna/strutto, pepe, cicoli, salame, pecorino e provolone, uova intere nell\'impasto) e, se proponi una variante, dillo; non aggiungere auguri di festività non coerenti con la data di oggi. FILE WORD ED EXCEL: sotto le tue risposte lunghe l\'utente trova i pulsanti «⬇ Word» e, se c\'è una tabella, «⬇ Excel». Quando chiede un documento Word, una relazione, una procedura, un verbale o una tabella/foglio Excel da scaricare, scrivi il contenuto COMPLETO in markdown (titolo con #, sezioni con ##, elenchi, tabelle con |) e di\' in una riga che può scaricarlo con il pulsante sotto la risposta. Non dire che non puoi creare file Word o Excel; l\'Excel contiene solo i dati delle tabelle (niente formule né grafici): se servono, dillo. DATABASE: se l\'utente chiede di creare un database, scrivi uno script SQL per SQLite in un blocco ```sql (CREATE TABLE con chiavi primarie e riferimenti, poi INSERT con dati realistici ma di esempio) e spiega in poche righe le tabelle; sotto la risposta compare il pulsante «⬇ Database» che crea il file .sqlite (si apre con DB Browser for SQLite; in Access o Excel si importa dalle tabelle esportate in Excel). Non scrivere MySQL/Access/SQL Server: solo sintassi SQLite. Non dire che non puoi creare database. PRESENTAZIONI POWERPOINT: se c\'è almeno un titolo di sezione con ## compare anche il pulsante «⬇ PowerPoint». Quando l\'utente chiede una presentazione o delle slide, scrivi: «# Titolo», una riga di sottotitolo, poi UNA sezione «## Titolo slide» per ogni slide con 3-6 punti elenco brevi (massimo 12 parole l\'uno), eventualmente una tabella piccola, e se utile una riga «Note: …» con il testo che il relatore dirà. Se l\'utente chiede le note del relatore, OGNI slide deve avere, subito dopo i punti, una riga che inizia esattamente con «Note: » (2-3 frasi che il relatore dirà), scritta in testo semplice, senza grassetto e senza elenco puntato. Di\' che può scaricare la presentazione con il pulsante sotto la risposta (niente immagini né animazioni). INTESTAZIONI TECNICHE: non citare mai tra parentesi o virgolette intestazioni interne come [RISULTATI WEB] o [Fine risultati]; indica la fonte con il nome del sito.';
 function looksGarbledFinal(t) {
   const x = String(t || '');
   if (/FINAL_?ANS/i.test(x)) return true;                                   // marcatore guasto
@@ -1924,6 +1972,8 @@ async function handlerCore(req) {
       const baseSystemPrompt = sys ? sys.content : 'Sei AInstAIn, un assistente AI italiano. Rispondi SEMPRE nella stessa lingua dell\'ultimo messaggio dell\'utente (italiano se la lingua non è chiara).';
       let reactSystemPrompt = folderMode ? buildFolderSystemPrompt(baseSystemPrompt) : buildReActSystemPrompt(baseSystemPrompt);
       if (needsSensitiveDisclaimer(userText)) reactSystemPrompt += SENSITIVE_DISCLAIMER_INSTRUCTION;
+      const _complex = !folderMode && !folderResume && isComplexRequest(userText);
+      if (_complex) reactSystemPrompt += PLAN_INSTRUCTION;
 
       let reactMessages = [{ role: 'system', content: reactSystemPrompt }, ...messages.filter(m => m.role !== 'system')];
       const _stepsBase = reactMessages.length;           // da qui in poi: i passi del loop (assistente + osservazione)
@@ -1932,10 +1982,25 @@ async function handlerCore(req) {
       const _startStep = folderResume ? Math.min(Math.max(parseInt(folderResume.step, 10) || 1, 1), _maxSteps) : 1;
       let usedWeb = false;
       let finalAnswer = null;
+      let _fastDone = false;
       let lastActionSignature = null;
       let truncationRetried = false;
       let garbledRetries = 0;
       let lastModelUsed = null, lastProviderUsed = null, lastR = null;
+
+      // MODALITÀ VELOCE (15 nov 2026, voce 2.147): domanda semplice = una sola chiamata, senza il prompt a strumenti.
+      if (!folderMode && !folderResume && isSimpleAgentQuestion(userText, needsWeb)) {
+        try {
+          send({ type: 'agent_thought', thought: 'Domanda semplice: rispondo direttamente (modalità veloce).', step: 1 });
+          const _fastSys = baseSystemPrompt + (needsSensitiveDisclaimer(userText) ? SENSITIVE_DISCLAIMER_INSTRUCTION : '') + '\n\n---\nRispondi direttamente e in modo chiaro, con l\'informazione chiave nella prima frase. Se per rispondere servirebbero dati aggiornati, un calcolo preciso o un\'azione che non puoi fare qui, dillo in una frase invece di inventare. Non scrivere THOUGHT/ACTION.\n---';
+          const _fr = await callWithFallback(providers, [{ role: 'system', content: _fastSys }, ...messages.filter(m => m.role !== 'system')], maxTokens, temperature, model);
+          const _ft = String(_fr.text || '').trim();
+          if (_ft && !looksGarbledFinal(_ft) && !/^\s*(THOUGHT|ACTION)\s*:/i.test(_ft)) {
+            finalAnswer = _ft; _fastDone = true;
+            lastModelUsed = _fr.model; lastProviderUsed = _fr.provider; lastR = _fr;
+          }
+        } catch (e) { console.log('[AI] modalità veloce fallita, uso il ciclo normale: ' + e.message); }
+      }
 
       // FIX 2026-09-19: bug reale trovato in test utente — per domande su
       // notizie/prezzi/eventi recenti l'Agente a volte rispondeva SENZA MAI
@@ -1976,7 +2041,9 @@ async function handlerCore(req) {
       const MAP_NOT_GEO_RE = /(mapp[ae]\s+(?:mental\w*|concettual\w*|del\s+sito|di\s+calore|dei\s+processi)|mind\s*map|heat\s*map|sitemap)|\b(traduc\w*|traduzion\w*|tradur\w*|translat\w*)\b/i;
       const FACTUAL_IMG_RE = /\b(cartin[ae]|carta\s+geografic\w*|mapp[ae]|planimetri\w*|piantin\w*|atlant\w*|maps?|atlas|floor\s*plan|flag|bandier\w*|grafico\s+(?:dei|del|di)\s+dat\w*)\b/i;
       const ILLUSTRATION_RE = /(disegn\w*|illustra\w*|dipingi\w*|fantasy|immaginari\w*|inventat\w*|acquerell\w*|fumetto|cartoon|stile\s|draw|paint|illustrat\w*|fictional)/i;
-      for (let step = _startStep; step <= _maxSteps; step++) {
+      for (let step = _startStep; step <= (_fastDone ? 0 : _maxSteps); step++) {
+        // Stop dell'utente (voce 2.049): se il browser ha chiuso la richiesta, non si spendono altri token.
+        if (req.signal && req.signal.aborted) { console.log('[AI] Agente: interrotto dall\'utente'); return; }
         // Timeout di sicurezza (2026-10-11): oltre 40s si smette di cercare e si passa alla sintesi con quanto raccolto.
         if (Date.now() - _agentStartedAt > 40000) { console.log('[AI] Agente: timeout 40s, passo alla sintesi'); break; }
         // Cartella (5 nov): prima ricerca forzata sulla parola chiave della domanda. Senza, il modello legge a caso (es. solo
@@ -1993,7 +2060,7 @@ async function handlerCore(req) {
 
         let stepText;
         try {
-          const r = await callWithFallback(folderMode ? folderProviders(providers) : providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
+          const r = await callWithFallback(folderMode ? folderProviders(providers) : providers, folderMode ? reactMessages : compactObservations(reactMessages), 1100, 0.3, folderMode ? FOLDER_MODEL : model);
           stepText = r.text;
           lastModelUsed = r.model; lastProviderUsed = r.provider; lastR = r;
         } catch (e) {
@@ -2008,7 +2075,7 @@ async function handlerCore(req) {
           // pochi secondi, trova provider liberi e risolve da solo.
           console.log('[AI] Agente: passo fallito su entrambi i provider (' + e.message + '), ritento una volta...');
           try {
-            const r2 = await callWithFallback(folderMode ? folderProviders(providers) : providers, reactMessages, 1100, 0.3, folderMode ? FOLDER_MODEL : model);
+            const r2 = await callWithFallback(folderMode ? folderProviders(providers) : providers, folderMode ? reactMessages : compactObservations(reactMessages), 1100, 0.3, folderMode ? FOLDER_MODEL : model);
             stepText = r2.text;
             lastModelUsed = r2.model; lastProviderUsed = r2.provider; lastR = r2;
           } catch (e2) {
@@ -2291,6 +2358,21 @@ async function handlerCore(req) {
         }
       }
 
+      // AUTO-CONTROLLO (voce 2.086): la risposta dichiara un'azione mai eseguita -> una sola riscrittura onesta.
+      if (!folderMode && finalAnswer && !_fastDone) {
+        const _claim = unbackedClaim(finalAnswer, reactMessages);
+        if (_claim) {
+          try {
+            send({ type: 'agent_thought', thought: 'Controllo la risposta: dice di aver ' + _claim + ' ma non l\'ho fatto. La correggo.', step: 99 });
+            const _fx = await callWithFallback(providers, [
+              { role: 'system', content: baseSystemPrompt + '\n\nAUTOVALUTAZIONE: la bozza di risposta qui sotto afferma di aver eseguito un\'azione che NON è stata eseguita (nessuno strumento è stato chiamato). Riscrivi la risposta nella stessa lingua dell\'utente: mantieni le informazioni utili, ma NON dire di aver salvato/inviato/creato nulla; spiega in una frase cosa è stato fatto davvero e cosa no. Niente THOUGHT/ACTION.' },
+              { role: 'user', content: 'Domanda dell\'utente: ' + userText + '\n\nBozza da correggere:\n' + finalAnswer }
+            ], maxTokens, 0.2, model);
+            const _fxt = String(_fx.text || '').trim();
+            if (_fxt && !looksGarbledFinal(_fxt) && !unbackedClaim(_fxt, reactMessages)) finalAnswer = _fxt;
+          } catch (e) { console.log('[AI] auto-controllo non riuscito: ' + e.message); }
+        }
+      }
       if (!folderMode && finalAnswer) { const _pd = ipPlaceDisclosure(req, userText, finalAnswer); if (_pd) finalAnswer = _pd + finalAnswer; }
       checkDateConsistency(finalAnswer, WEB_TRIGGERS.some(re => re.test(userText)));
       send({ type: 'meta', webSearchUsed: usedWeb, model: lastModelUsed, provider: lastProviderUsed, alert: buildAlert(lastR) });
