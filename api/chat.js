@@ -1781,6 +1781,26 @@ async function handlerCore(req) {
   const smartModel = selectBestModel(userText, model);
   const sseH       = { ...cors, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' };
 
+  // 2026-11-16: "che ore sono / che giorno è oggi": risposta immediata dall'orologio del server (ora di Roma), senza ricerca web né modelli.
+  // Prima la sintesi Multi-AI rispondeva "i risultati non riportano l'ora attuale".
+  {
+    const _tq = String(userText || '').trim().replace(/[?!.,]+$/g, '');
+    const _isTime = _tq.length <= 60 && /^(?:(?:ehi|ciao|scusa|senti)\s+\w+[\s,]*)?(?:(?:dimmi|mi\s+dici|sai)\s+)?(?:che\s+ore?\s+(?:sono|è|e'|fa)|che\s+ora\s+(?:è|e'|fa)|l['’]ora(?:\s+esatta)?|le\s+ore|ore\s+sono|che\s+giorno\s+è(?:\s+oggi)?|che\s+giorno\s+e'(?:\s+oggi)?|che\s+data\s+(?:è|e')(?:\s+oggi)?|what\s+time\s+is\s+it)(?:\s+(?:adesso|ora|ora\s+esatta|oggi|per\s+favore))?$/i.test(_tq);
+    if (_isTime && !noWeb) {
+      const _now = new Date();
+      const _hh = _now.toLocaleTimeString('it-IT', { timeZone: 'Europe/Rome', hour: '2-digit', minute: '2-digit' });
+      const _dd = _now.toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+      const _en = /^what/i.test(_tq);
+      const _msg = _en ? ('It is ' + _hh + ' in Italy (Rome time), ' + _dd + '.') : ('Sono le ' + _hh + ' (ora di Roma) di ' + _dd + '.');
+      return new Response(makeSSE(async (send) => {
+        send({ type: 'meta', webSearchUsed: false });
+        for (let i = 0; i < _msg.length; i += 4) send({ type: 'token', token: _msg.slice(i, i + 4) });
+        send({ type: 'done' });
+      }), { status: 200, headers: sseH });
+    }
+  }
+
+
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
   const _newsWrite = NEWS_WRITE_RE.test(String(userText || ''));   // 2026-10-24: "scrivi una notizia su..." => ricerca web sempre
   let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || WEB_TRIGGERS.some(re => re.test(searchText)));
