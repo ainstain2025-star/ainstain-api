@@ -76,6 +76,14 @@ export default async function handler(req) {
   if (up) {
     const now = Date.now();
 
+    // ── 2026-11-16: accesso Premium DEDICATO al tablet di papà (clone). Codice nella variabile Vercel PAPA_CODE (mai nel repo).
+    //    Livello 'limited' (tetti giornalieri per IP, vedi LIMITED_MSG_CAP) con token di 365 giorni.
+    const papaCode = (process.env.PAPA_CODE || '').trim().toUpperCase();
+    if (papaCode.length >= 8 && up === papaCode) {
+      const token = await signToken(jwtSecret, { premium: true, tier: 'limited', who: 'papa' }, '365d');
+      return json({ token, tier: 'limited' }, 200, cors);
+    }
+
     // ── PREMIUM_LIMITED: codice pubblico a tempo ──
     const pub = limitedPublicList(process.env).find(c => c.code === up);
     if (pub) {
