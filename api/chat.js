@@ -1456,9 +1456,20 @@ function navFastReply(userText, messages) {
 }
 // Richieste locali: la città viene dedotta in modo APPROSSIMATO dalla rete (header Vercel), usata solo per questa risposta, mai salvata.
 const LOC_RE = /\b(meteo|previsioni|clima|ristorant\w*|pizzeri\w*|trattori\w*|farmaci\w*|negozi|vicino a me|nei dintorni|qui vicino|near me|weather|restaurants?)\b/i;
+// 2026-11-16: "meteo gragnano domani" (senza preposizione né maiuscole) indica comunque una città: tolte le parole del meteo e del tempo, se resta una parola di 4+ lettere l'utente ha nominato un luogo.
+const WX_FILLER_RE = /\b(meteo|previsioni|previsione|tempo|clima|che|come|com|cosa|fa|farà|sarà|sara|il|lo|la|le|un|una|di|del|della|a|ad|in|per|su|oggi|domani|dopodomani|stasera|stanotte|adesso|ora|settimana|weekend|piove|piovera|pioverà|pioggia|temperatura|temperature|ombrello|neve|ci|sono|è|e|dimmi|dammi|vorrei|sapere|puoi|potresti|mi|dire|quanto|fara|farà|freddo|caldo|weather|forecast|today|tomorrow|the|in|for|what|is)\b/gi;
+function userNamesPlace(userText) {
+  try {
+    const t = String(userText || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (!/\b(meteo|previsioni|tempo|clima|piov\w*|pioggia|temperatur\w*|ombrello|neve|weather|forecast)\b/i.test(t)) return false;
+    const rest = t.replace(/[^\p{L}\s'’-]/gu, ' ').replace(WX_FILLER_RE, ' ').replace(/\b\p{L}{1,3}\b/gu, ' ').trim();
+    return rest.length >= 4;
+  } catch { return false; }
+}
 function ipPlaceNote(req, userText) {
   try {
     if (!LOC_RE.test(userText || '')) return '';
+    if (userNamesPlace(userText)) return '';
     const raw = req.headers.get('x-vercel-ip-city');
     if (!raw) return '';
     const city = decodeURIComponent(raw).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '');
@@ -1475,6 +1486,7 @@ const cityIt = (c) => CITY_IT[String(c).toLowerCase()] || c;
 function ipPlaceDisclosure(req, userText, answer) {
   try {
     if (!answer || !LOC_RE.test(userText || '')) return '';
+    if (userNamesPlace(userText)) return '';
     if (/\b(a|ad|in|di|su|presso|vicino\s+a|near)\s+\p{L}{3,}/iu.test((userText || '').replace(/\b(di\s+(?:domani|oggi|stasera|dopodomani)|in\s+(?:zona|giro|centro))\b/gi, ''))) return '';
     const raw = req.headers.get('x-vercel-ip-city');
     if (!raw) return '';
