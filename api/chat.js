@@ -810,6 +810,42 @@ async function searchDuckDuckGo(query) {
   }).filter(Boolean).slice(0, 5);
   return out.join('\n');
 }
+
+// 2026-11-16: METEO REALE da Open-Meteo (gratuito, senza chiave). Le pagine trovate dai motori di ricerca davano solo titoli vecchi
+// ("Nessuno di questi fornisce dati aggiornati"). Se la richiesta e' sul meteo e si riconosce una localita', i dati veri vengono messi in testa.
+const WEATHER_RE = /\b(meteo|previsioni|che tempo|com['’]è il tempo|come sarà il tempo|tempo (?:a|ad|di|per|su|in)\b|piov\w*|pioggia|temperatur\w*|ombrello|nevic\w*|neve|weather|forecast)\b/i;
+const WMO_IT = { 0:'sereno',1:'prevalentemente sereno',2:'parzialmente nuvoloso',3:'coperto',45:'nebbia',48:'nebbia con brina',51:'pioviggine leggera',53:'pioviggine',55:'pioviggine intensa',56:'pioviggine gelata',57:'pioviggine gelata intensa',61:'pioggia debole',63:'pioggia',65:'pioggia forte',66:'pioggia gelata',67:'pioggia gelata forte',71:'neve debole',73:'neve',75:'neve forte',77:'granuli di neve',80:'rovesci deboli',81:'rovesci',82:'rovesci violenti',85:'rovesci di neve',86:'rovesci di neve forti',95:'temporale',96:'temporale con grandine',99:'temporale con forte grandine' };
+function weatherPlace(q) {
+  const t = String(q || '').replace(/\([^)]*\)/g, ' ');
+  const CAP = "[A-ZÀ-Ý][a-zà-ÿ'’]+(?:[- ](?:di |del |della |dei |sul |sulla )?[A-ZÀ-Ý][a-zà-ÿ'’]+)?";
+  let m = new RegExp("\\b(?:a|ad|di|per|su|in|da|presso|nel|nella)\\s+(" + CAP + ")").exec(t);
+  if (!m) m = new RegExp("\\b(?:meteo|previsioni|tempo)\\s+(?:a\\s+|di\\s+|per\\s+)?(" + CAP + ")").exec(t);
+  if (!m) { const all = t.match(new RegExp(CAP, 'g')) || []; const stop = /^(Com|Come|Che|Cosa|Dimmi|Meteo|Previsioni|Oggi|Domani|Dopodomani|Il|La|Lo|Un|Una|Qual|Quale|Quanto|Sai|Ciao|Ehi|AInstAIn)$/i; const c = all.filter(w => !stop.test(w.split(/[ -]/)[0])); if (c.length) m = [null, c[0]]; }
+  return m ? m[1].trim() : '';
+}
+async function weatherContext(query) {
+  if (!WEATHER_RE.test(String(query || ''))) return '';
+  const place = weatherPlace(query); if (!place) return '';
+  try {
+    let x = null;
+    for (const nm of [place, place.split(/\s+/)[0]]) {
+      const gr = await fetchTimeout('https://geocoding-api.open-meteo.com/v1/search?name=' + encodeURIComponent(nm) + '&count=5&language=it&format=json', {}, 5000);
+      if (!gr.ok) continue;
+      const list = ((await gr.json()) || {}).results || [];
+      x = list.find(r => r.country_code === 'IT') || list[0]; if (x) break;
+    }
+    if (!x) return '';
+    const fr = await fetchTimeout('https://api.open-meteo.com/v1/forecast?latitude=' + x.latitude + '&longitude=' + x.longitude + '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max&timezone=Europe%2FRome&forecast_days=5', {}, 6000);
+    if (!fr.ok) return '';
+    const d = (await fr.json()).daily; if (!d || !d.time) return '';
+    const rows = d.time.map((day, i) => {
+      const wd = new Date(day + 'T12:00:00Z').toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', weekday: 'long', day: 'numeric', month: 'long' });
+      return '- ' + wd + ' (' + day + '): ' + (WMO_IT[d.weather_code[i]] || 'variabile') + ', min ' + Math.round(d.temperature_2m_min[i]) + '°C / max ' + Math.round(d.temperature_2m_max[i]) + '°C, probabilità di pioggia ' + d.precipitation_probability_max[i] + '%, pioggia prevista ' + d.precipitation_sum[i] + ' mm, vento fino a ' + Math.round(d.wind_speed_10m_max[i]) + ' km/h';
+    });
+    console.log('[web] meteo Open-Meteo per ' + x.name + (x.admin1 ? ' (' + x.admin1 + ')' : ''));
+    return 'PREVISIONI METEO REALI (fonte: Open-Meteo, aggiornate adesso) per ' + x.name + (x.admin1 ? ', ' + x.admin1 : '') + ':\n' + rows.join('\n') + '\nUsa questi dati per rispondere (domani = il giorno dopo oggi in Italia) e cita Open-Meteo come fonte.';
+  } catch (e) { console.log('[web] Open-Meteo fallito: ' + e.message); return ''; }
+}
 async function tavilySearch(query, apiKey) {
   const keyed = apiKey && apiKey !== 'KEYLESS';
   const chain = [];
@@ -830,7 +866,8 @@ async function tavilySearch(query, apiKey) {
     try { main = await searchDuckDuckGo(query); if (main) used = 'DuckDuckGo'; } catch (e) { console.log('[web] DuckDuckGo fallito: ' + e.message); }
   }
   console.log('[web] motore usato: ' + (used || 'NESSUNO') + ' <- "' + String(query).slice(0, 60) + '"');
-  const res = [main, news].filter(Boolean).join('\n\n');
+  const wx = await weatherContext(query);
+  const res = [wx, main, news].filter(Boolean).join('\n\n');
   if (!res) throw new Error('nessun motore di ricerca ha risposto');
   return res;
 }
