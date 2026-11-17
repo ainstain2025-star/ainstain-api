@@ -1756,6 +1756,13 @@ async function handlerCore(req) {
   // semantico, multi-modello, agente). webQuery = la domanda pulita dell'utente: serve come testo di ricerca quando il
   // messaggio contiene gli estratti del documento (altrimenti la ricerca partirebbe dall'intestazione degli estratti).
   const noWeb      = body.noWeb === true || folderMode;   // 2026-11-01: con la cartella attiva nessuna ricerca web in nessun ramo
+  // 2026-11-17: Sasà (clone per una persona anziana) manda simple:true -> risposte SEMPLICI, BREVI, senza termini difficili.
+  if (body.simple === true && Array.isArray(messages) && !folderMode) {
+    const SIMPLE_NOTE = '\n\nIMPORTANTE - L\'utente è una persona anziana che ascolta la risposta a voce. Rispondi in modo SEMPLICE e BREVE: al massimo 3-4 frasi corte, parole di tutti i giorni, niente termini tecnici o inglesi (se serve uno, spiegalo in poche parole), niente tabelle, niente elenchi lunghi, niente fonti o link. Se è una ricetta o una procedura, dai i passaggi numerati, brevi e chiari. Comincia con la risposta, senza giri di parole. Solo se l\'utente chiede di approfondire ("dimmi di più", "spiegami meglio") puoi essere più ampio, restando semplice.';
+    const _si = messages.findIndex(m => m && m.role === 'system');
+    if (_si !== -1) messages[_si] = { ...messages[_si], content: String(messages[_si].content || '') + SIMPLE_NOTE };
+    else messages.unshift({ role: 'system', content: SIMPLE_NOTE.trim() });
+  }
   const webQuery   = (typeof body.webQuery === 'string' && body.webQuery.trim()) ? body.webQuery.trim().slice(0, 300) : '';
   // ── 2026-10-20: domande di seguito ("e domani?", "e a Napoli?") — da sole non dicono cosa cercare: la ricerca web
   // partiva con 2-3 parole senza contesto e non trovava nulla. Ora, se il messaggio è breve, si antepone la domanda precedente.
