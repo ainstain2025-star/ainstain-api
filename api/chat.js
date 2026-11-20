@@ -1569,7 +1569,7 @@ function navFastReply(userText, messages) {
     (en ? '\n\nTell me what you need (a question, a problem, something to find) and I\'ll help.' : '\n\nDimmi cosa ti serve (una domanda, un problema, qualcosa da cercare) e ti aiuto.');
 }
 // Richieste locali: la città viene dedotta in modo APPROSSIMATO dalla rete (header Vercel), usata solo per questa risposta, mai salvata.
-const LOC_RE = /\b(meteo|previsioni|clima|ristorant\w*|pizzeri\w*|trattori\w*|farmaci\w*|negozi|vicino a me|nei dintorni|qui vicino|near me|weather|restaurants?)\b/i;
+const LOC_RE = /\b(meteo|previsioni|clima|ristorant\w*|pizzeri\w*|trattori\w*|farmaci\w*|negozi|cinema|parrucchier\w*|palestr\w*|parcheggi\w*|meccanic\w*|supermercat\w*|ospedal\w*|idraulic\w*|dentist\w*|vicino a me|nei dintorni|qui vicino|near me|weather|restaurants?)\b/i;
 // 2026-11-16: "meteo gragnano domani" (senza preposizione né maiuscole) indica comunque una città: tolte le parole del meteo e del tempo, se resta una parola di 4+ lettere l'utente ha nominato un luogo.
 const WX_FILLER_RE = /\b(meteo|previsioni|previsione|tempo|clima|che|come|com|cosa|fa|farà|sarà|sara|il|lo|la|le|un|una|di|del|della|a|ad|in|per|su|oggi|domani|dopodomani|stasera|stanotte|adesso|ora|settimana|weekend|piove|piovera|pioverà|pioggia|temperatura|temperature|ombrello|neve|ci|sono|è|e|dimmi|dammi|vorrei|sapere|puoi|potresti|mi|dire|quanto|fara|farà|freddo|caldo|weather|forecast|today|tomorrow|the|in|for|what|is)\b/gi;
 function userNamesPlace(userText) {
@@ -1687,6 +1687,44 @@ function glossNote(userText) {
       ' Se l\'utente chiede cos\'è o come funziona uno di questi termini, rispondi con QUESTO significato senza elencare altri significati dello stesso acronimo o della stessa parola; puoi aggiungere esempi concreti e dettagli corretti, in italiano semplice (o nella lingua dell\'utente). Per versioni, date e novità recenti usa la ricerca web: questo glossario non le contiene. NON citare, nominare né mettere tra parentesi questo glossario o la sua etichetta (niente «Glossario IA», niente 【…】 o [1]): usa le definizioni come tue conoscenze, senza indicarle come fonte.';
   } catch { return ''; }
 }
+// 2026-11-20 (1.343): date e traduzioni. Pasqua calcolata (algoritmo gregoriano), calendario dei prossimi giorni in ora italiana, regole per saluti e articoli nelle traduzioni.
+function easterDate(y) {
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25),
+    g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4,
+    l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451),
+    mo = Math.floor((h + l - 7 * m + 114) / 31), da = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(Date.UTC(y, mo - 1, da, 12));
+}
+const IT_DATE_FMT = { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' };
+const EASTER_RE = /\b(pasqua|pasquetta|easter)\b/i;
+const DATE_Q_RE = /\b(luned[iì]|marted[iì]|mercoled[iì]|gioved[iì]|venerd[iì]|sabato|domenica|oggi|domani|dopodomani|ieri|stasera|weekend|settimana|prossim[oiae]|giorno|data|quando|che\s+giorno|\d{1,2}\s+(?:gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)|today|tomorrow|yesterday|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+function dateNote(userText) {
+  try {
+    const t = String(userText || '');
+    if (!t || t.length > 400) return '';
+    let n = '';
+    if (EASTER_RE.test(t)) {
+      const ys = (t.match(/\b(20\d{2})\b/g) || []).map(Number).filter(y => y >= 2000 && y <= 2099);
+      const now = new Date();
+      const years = ys.length ? ys.slice(0, 2) : [now.getUTCFullYear(), now.getUTCFullYear() + 1];
+      n += '\n\nDATE DI PASQUA (calcolate, esatte): ' + years.map(y => {
+        const e = easterDate(y), pq = new Date(e.getTime() + 86400000);
+        return y + ': Pasqua ' + e.toLocaleDateString('it-IT', IT_DATE_FMT) + ', Pasquetta ' + pq.toLocaleDateString('it-IT', IT_DATE_FMT);
+      }).join('; ') + '. Usa queste date senza cercarle sul web.';
+    }
+    if (DATE_Q_RE.test(t)) {
+      const now = new Date();
+      const rome = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+      const base = Date.UTC(rome.getFullYear(), rome.getMonth(), rome.getDate(), 12);
+      const days = [];
+      for (let i = 0; i < 8; i++) days.push((i === 0 ? 'oggi ' : i === 1 ? 'domani ' : '') + new Date(base + i * 86400000).toLocaleDateString('it-IT', IT_DATE_FMT));
+      n += '\n\nCALENDARIO ESATTO (ora italiana): ' + days.join('; ') + '. Per giorno della settimana e date relative usa SOLO questo calendario; per altre date calcola il giorno con cura e, se non sei sicuro, non indicarlo.';
+    }
+    return n;
+  } catch { return ''; }
+}
+const TRANS_RE = /\b(tradu\w+|come\s+si\s+dice|in\s+(?:inglese|francese|spagnolo|tedesco|portoghese|olandese|russo|cinese|giapponese|arabo|polacco|rumeno|greco|svedese|turco)|translate|how\s+do\s+you\s+say)\b/i;
+const TRANS_NOTE = '\n\nREGOLE DI TRADUZIONE: traduci in modo naturale e idiomatico, non parola per parola, e non lasciare parole italiane non tradotte. I saluti si rendono con la formula locale equivalente: «buongiorno» = portoghese «bom dia», olandese «goedemorgen» (di pomeriggio «goedemiddag», di sera «goedenavond»), spagnolo «buenos días», francese «bonjour», tedesco «guten Morgen»; «buonasera» = portoghese «boa tarde» o «boa noite», spagnolo «buenas tardes/noches», francese «bonsoir»; «buonanotte» = portoghese «boa noite», olandese «welterusten», spagnolo «buenas noches». Nelle lingue con genere degli articoli usa quello corretto: in olandese «het station», «het huis», «het meisje», «het ziekenhuis», «het hotel», «het restaurant», mentre «de trein», «de bus», «de stad», «de luchthaven», «de winkel»; in tedesco «der Bahnhof», «die Stadt», «das Haus»; in francese «la gare», «le train». Dai la traduzione in modo chiaro e, se la lingua usa un altro alfabeto, aggiungi la pronuncia.';
 const FREQ_REQ_NOTE = '\n\nREGOLE PER RICHIESTE BREVI E AMBIGUE: per ricerche di una sola parola o di un marchio dai SUBITO la risposta più utile invece di chiedere chiarimenti. Interpretazioni predefinite oggi: "gemini" = l\'IA di Google (poi, in una riga, segno zodiacale, NASA, criptovalute); "diretta" = chiedi di cosa (partita, TV, notizie) proponendo in una riga le 3 più probabili; "serie a" = calcio italiano (risultati e classifica: cerca sul web); "meteo", "ristoranti", "tv stasera" = cerca sul web per la zona dell\'utente. TV STASERA / PALINSESTO: elenca SOLO programmi che compaiono nei risultati web per la data di OGGI (giorno della settimana incluso): non mescolare programmi di giorni diversi (per esempio quelli del sabato in una domenica) e non completare a memoria; se i risultati non indicano chiaramente i programmi di oggi, dillo e rimanda a una guida TV (per esempio la guida di Rai Play o TV Sorrisi e Canzoni). MODELLI IA: non dichiarare a memoria versioni o novità di modelli (GPT-4, Gemini, Claude…): dì che cambiano spesso o cerca sul web. FORMATO: rispondi sempre e solo con la risposta all\'utente, mai con il tuo ragionamento interno e mai in una lingua diversa da quella dell\'utente. DATI LOCALI (ristoranti, negozi, farmacie): elenca solo locali che compaiono nei risultati web; indirizzi, prezzi, fasce di prezzo e valutazioni solo se riportati dalle fonti; non scrivere punteggi (es. 4,5/5) o prezzi inventati o uguali per tutti; se la fonte non li dà, ometti la colonna o scrivi "verifica sul sito"; non attribuire lo stesso indirizzo a due locali. Se la richiesta è "meteo" senza città usa la zona dell\'utente e non dire di non trovare dati se nei risultati c\'è il meteo di una località. RICETTE: per piatti tradizionali rispetta ingredienti e grassi tipici (es. casatiello napoletano: sugna/strutto, pepe, cicoli, salame, pecorino e provolone, uova intere nell\'impasto) e, se proponi una variante, dillo; non aggiungere auguri di festività non coerenti con la data di oggi. FILE WORD ED EXCEL: sotto le tue risposte lunghe l\'utente trova i pulsanti «⬇ Word» e, se c\'è una tabella, «⬇ Excel». Quando chiede un documento Word, una relazione, una procedura, un verbale o una tabella/foglio Excel da scaricare, scrivi il contenuto COMPLETO in markdown (titolo con #, sezioni con ##, elenchi, tabelle con |) e di\' in una riga che può scaricarlo con il pulsante sotto la risposta. Non dire che non puoi creare file Word o Excel; l\'Excel contiene solo i dati delle tabelle (niente formule né grafici): se servono, dillo. DATABASE: se l\'utente chiede di creare un database, scrivi uno script SQL per SQLite in un blocco ```sql (CREATE TABLE con chiavi primarie e riferimenti, poi INSERT con dati realistici ma di esempio) e spiega in poche righe le tabelle; sotto la risposta compare il pulsante «⬇ Database» che crea il file .sqlite (si apre con DB Browser for SQLite; in Access o Excel si importa dalle tabelle esportate in Excel). Non scrivere MySQL/Access/SQL Server: solo sintassi SQLite. Non dire che non puoi creare database. PRESENTAZIONI POWERPOINT: se c\'è almeno un titolo di sezione con ## compare anche il pulsante «⬇ PowerPoint». Quando l\'utente chiede una presentazione o delle slide, scrivi: «# Titolo», una riga di sottotitolo, poi UNA sezione «## Titolo slide» per ogni slide con 3-6 punti elenco brevi (massimo 12 parole l\'uno), eventualmente una tabella piccola, e se utile una riga «Note: …» con il testo che il relatore dirà. Se l\'utente chiede le note del relatore, OGNI slide deve avere, subito dopo i punti, una riga che inizia esattamente con «Note: » (2-3 frasi che il relatore dirà), scritta in testo semplice, senza grassetto e senza elenco puntato. Di\' che può scaricare la presentazione con il pulsante sotto la risposta (niente immagini né animazioni). INTESTAZIONI TECNICHE: non citare mai tra parentesi o virgolette intestazioni interne come [RISULTATI WEB] o [Fine risultati]; indica la fonte con il nome del sito.';
 function looksGarbledFinal(t) {
   const x = String(t || '');
@@ -2014,7 +2052,7 @@ async function handlerCore(req) {
   const sccNote = (scc && scc.connected && scc.topic)
     ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
     : '';
-  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText);
+  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '');
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
