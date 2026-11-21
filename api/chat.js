@@ -205,6 +205,7 @@ const WEB_TRIGGERS = [
   /\b(prezzo|prezzi|costa|costano|costerebbe|sconto|scontato|offerta|offerte)\b/i,
   /\bcerca\b/i,
   // FIX 2026-10-24 (stress test 1.030, p03/p02/p07): programmi TV e sport senza parole di tempo esplicite
+  /\b(cinema|film in sala|programmazione|spettacol\w+|concert[oi])\b/i,
   /\b(stasera|stanotte|questa sera|palinsesto|programmi? tv|in tv|serie a|serie b|champions|atp|wta|formula 1|motogp)\b/i,
 ];
 // Le regex CALC_RE/IMAGE_RE/DATETIME_RE/REMEMBER_RE del vecchio dispatcher
@@ -1612,9 +1613,16 @@ function ipPlaceDisclosure(req, userText, answer) {
 // 2026-10-17: richieste locali brevi senza città ("meteo", "ristoranti"): aggiunge la città stimata dalla rete alla query di
 // RICERCA WEB (prima la ricerca partiva solo da "meteo" e non trovava nulla). Non modifica il testo mostrato all'utente.
 const CITY_IN_TEXT_RE = /\b(?:a|ad|in|di|su|per|presso|near|in)\s+[A-ZÀ-Ý][\p{L}'’\-]+/u;
+const CINEMA_RE = /\b(cinema|al cinema|film in sala|programmazione\s+(?:cinema|film)|spettacol\w+|teatro|concert[oi])\b/i;
+const CINEMA_NOTE = '\n\nPROGRAMMAZIONE (cinema, teatro, concerti, spettacoli): elenca SOLO titoli, sale e orari che compaiono nei [RISULTATI WEB] per la data richiesta. Non usare la memoria: i film in sala cambiano ogni settimana e quelli che ricordi sono quasi sempre vecchi. Non scrivere indirizzi, orari o nomi di sale che i risultati non riportano. Se i risultati non contengono la programmazione di quel giorno e di quella città, dillo in una riga e dai i link ai siti dove trovarla (per esempio mymovies.it, comingsoon.it, il sito del cinema) senza inventare nulla. Cita ogni fonte con il suo nome.';
 function geoEnrich(text, req) {
   try {
     const t = String(text || '');
+    if (t.length <= 120 && CINEMA_RE.test(t) && !/\bprogrammazione\b/i.test(t) && !CITY_IN_TEXT_RE.test(t)) {
+      const raw0 = req.headers.get('x-vercel-ip-city');
+      const c0 = raw0 ? decodeURIComponent(raw0).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '') : '';
+      return 'programmazione ' + t.trim() + (c0 ? ' ' + cityIt(c0) : '') + ' oggi';
+    }
     if (t.length > 120 || !LOC_RE.test(t) || CITY_IN_TEXT_RE.test(t)) return t;
     const raw = req.headers.get('x-vercel-ip-city');
     if (!raw) return t;
@@ -2052,7 +2060,7 @@ async function handlerCore(req) {
   const sccNote = (scc && scc.connected && scc.topic)
     ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
     : '';
-  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '');
+  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '');
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
