@@ -2022,7 +2022,7 @@ async function handlerCore(req) {
   // su richiesta esplicita (forceWeb/scc) o con parole forti di dati vivi, e il classificatore semantico non viene usato.
   const _sofiaP = (messages || []).some(m => m && m.role === 'system' && typeof m.content === 'string' && m.content.indexOf("Sei Sofia, l'assistente AI") !== -1);
   const SOFIA_WEB_RE = /\b(notizie|news|meteo|previsioni|classifica|risultati|partita|borsa|bitcoin|prezzo|prezzi|quanto costa|cerca|ricerca|elezioni|orari|programmazione|cinema)\b/i;
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(searchText) : WEB_TRIGGERS.some(re => re.test(searchText))));
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(String(webQuery || userText || '')) : WEB_TRIGGERS.some(re => re.test(searchText))));
   if (!noWeb && !_selfQ && !_sofiaP && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
