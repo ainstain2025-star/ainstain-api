@@ -2015,8 +2015,14 @@ async function handlerCore(req) {
 
   // ── Decisione unica: serve il web? (parole chiave -> poi giudizio semantico) ──
   const _newsWrite = NEWS_WRITE_RE.test(String(userText || ''));   // 2026-10-24: "scrivi una notizia su..." => ricerca web sempre
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || WEB_TRIGGERS.some(re => re.test(searchText)));
-  if (!noWeb && !_selfQ && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
+  // 2026-11-21: con la personalità Sofia (ascolto, relazioni, emozioni) parole come «ora», «oggi», «ultimo» o il giudizio semantico
+  // facevano partire la ricerca web su messaggi personali; se la ricerca falliva, a una persona in difficoltà arrivava il messaggio fisso
+  // «non riesco a raggiungere nessuna fonte di ricerca» (visto nel test Sofia: «Domani do le dimissioni…»). Per Sofia la ricerca parte solo
+  // su richiesta esplicita (forceWeb/scc) o con parole forti di dati vivi, e il classificatore semantico non viene usato.
+  const _sofiaP = (messages || []).some(m => m && m.role === 'system' && typeof m.content === 'string' && m.content.indexOf("Sei Sofia, l'assistente AI") !== -1);
+  const SOFIA_WEB_RE = /\b(notizie|news|meteo|previsioni|classifica|risultati|partita|borsa|bitcoin|prezzo|prezzi|quanto costa|cerca|ricerca|elezioni|orari|programmazione|cinema)\b/i;
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(searchText) : WEB_TRIGGERS.some(re => re.test(searchText))));
+  if (!noWeb && !_selfQ && !_sofiaP && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
   // ── 2026-10-20: tetto ricerche web (globale e per utente). Oltre il tetto si risponde senza web, dichiarandolo. ──
