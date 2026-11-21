@@ -1590,8 +1590,8 @@ function ipPlaceNote(req, userText) {
     const city = decodeURIComponent(raw).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '');
     const country = (req.headers.get('x-vercel-ip-country') || '').slice(0, 2).replace(/[^A-Za-z]/g, '');
     if (!city) return '';
-    return '\n\nPOSIZIONE APPROSSIMATA dell\'utente dedotta dalla rete: ' + city + (country ? ' (' + country.toUpperCase() + ')' : '') +
-      '. Usala SOLO se la richiesta è locale (meteo, ristoranti, negozi, "vicino a me") e l\'utente non indica un\'altra città; in quel caso dillo in una riga ("Ho usato la zona di ' + city + ' in base alla tua connessione: se è un\'altra città dimmelo") e cerca per quella città. Se l\'utente indica una città, usa quella.';
+    return '\n\nPOSIZIONE APPROSSIMATA dell\'utente dedotta dalla rete: ' + cityIt(city) + (country ? ' (' + country.toUpperCase() + ')' : '') +
+      '. Usala SOLO se la richiesta è locale (meteo, ristoranti, negozi, "vicino a me") e l\'utente non indica un\'altra città; in quel caso dillo in una riga ("Ho usato la zona di ' + cityIt(city) + ' in base alla tua connessione: se è un\'altra città dimmelo") e cerca per quella città. Se l\'utente indica una città, usa quella.';
   } catch { return ''; }
 }
 // 8 nov 2026 (stress test p12): per richieste locali senza città («ristoranti», «meteo») la risposta deve dire quale zona è stata usata.
@@ -1621,7 +1621,8 @@ function geoEnrich(text, req) {
     if (t.length <= 120 && CINEMA_RE.test(t) && !/\bprogrammazione\b/i.test(t) && !CITY_IN_TEXT_RE.test(t)) {
       const raw0 = req.headers.get('x-vercel-ip-city');
       const c0 = raw0 ? decodeURIComponent(raw0).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '') : '';
-      return 'programmazione ' + t.trim() + (c0 ? ' ' + cityIt(c0) : '') + ' oggi';
+      const _dq = new Date().toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', day: 'numeric', month: 'long', year: 'numeric' });
+      return 'programmazione ' + t.trim() + (c0 ? ' ' + cityIt(c0) : '') + ' oggi ' + _dq + ' film in sala orari mymovies comingsoon';
     }
     if (t.length > 120 || !LOC_RE.test(t) || CITY_IN_TEXT_RE.test(t)) return t;
     const raw = req.headers.get('x-vercel-ip-city');
