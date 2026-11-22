@@ -2848,6 +2848,19 @@ async function handlerCore(req) {
         webCtx = '\n\n[RISULTATI WEB - ' + today + ']\nHo cercato: "' + q + '".\n' + r + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati. Se vedi solo titoli, riporta solo ciò che i titoli dicono. La conversazione precedente resta valida: se i risultati riguardano un argomento o un oggetto diverso da quello di cui si sta parlando (per esempio un altro prodotto), ignorali e rispondi usando la conversazione, senza dire che i risultati non lo riportano.';
       }
     } catch(e) { console.error('Tavily:', e.message); }
+    // un secondo tentativo con la domanda originale dell'utente (la query arricchita a volte non restituisce nulla)
+    if (!webCtx) {
+      try {
+        const q2 = String(userText || '').replace(/---[\s\S]*?---/g, '').trim().slice(0, 200);
+        if (q2) {
+          const r2 = await tavilySearch(q2, tavilyKey);
+          if (r2) {
+            const today2 = new Date().toLocaleDateString('it-IT', { timeZone: 'UTC', day:'2-digit', month:'long', year:'numeric' });
+            webCtx = '\n\n[RISULTATI WEB - ' + today2 + ']\nHo cercato: "' + q2 + '".\n' + r2 + '\n[Fine risultati]\n\nUsa queste informazioni e cita le fonti. Se un dato non compare nei risultati NON aggiungerlo e non completarlo a memoria: dì che non è nei risultati.';
+          }
+        }
+      } catch(e) { console.error('Tavily retry:', e.message); }
+    }
   }
 
   // 2026-10-24: se serviva il web e NESSUN motore ha risposto, non si lascia rispondere il modello a memoria (inventa):
