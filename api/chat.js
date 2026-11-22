@@ -1746,7 +1746,9 @@ function geoEnrich(text, req) {
       const raw0 = req.headers.get('x-vercel-ip-city');
       const c0 = raw0 ? decodeURIComponent(raw0).slice(0, 60).replace(/[^\p{L}\p{N} .'\-]/gu, '') : '';
       const _dq = new Date().toLocaleDateString('it-IT', { timeZone: 'Europe/Rome', day: 'numeric', month: 'long', year: 'numeric' });
-      return t.trim() + ' ' + (c0 ? cityIt(c0) : 'Napoli') + ' programmazione film oggi ' + _dq;
+      // solo la frase che parla di cinema/teatro (toglie «Mi sento giù,» davanti), e «Italia» per non avere siti esteri (visto: Sortir à Paris)
+      const _seg = t.split(/[,;.!?]+/).map(x => x.trim()).filter(x => CINEMA_RE.test(x)).pop() || t.trim();
+      return _seg + ' ' + (c0 ? cityIt(c0) : 'Napoli') + ' Italia programmazione film oggi ' + _dq;
     }
     if (t.length > 120 || !LOC_RE.test(t) || CITY_IN_TEXT_RE.test(t)) return t;
     const raw = req.headers.get('x-vercel-ip-city');
