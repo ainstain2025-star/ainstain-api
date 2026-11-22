@@ -1199,10 +1199,10 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 // Se TUTTI i provider hanno risposto solo 429/503 e nessun testo e' partito, si attende qualche secondo e si riprova (fino a 3 volte).
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   // Groq conta max_tokens nel limite di token in uscita al minuto del modello foto: per le foto si tiene un tetto prudente (errore "Request too large ... output tokens per minute")
-  if (messagesHaveImage(messages)) maxTokens = Math.min(maxTokens || 1800, 1800);
+  if (messagesHaveImage(messages)) maxTokens = Math.min(maxTokens || 1400, 1400);
   let _emittedAny = false;
   const _tok = (t) => { _emittedAny = true; onToken(t); };
-  const waits = [3000, 6000, 9000];
+  const waits = messagesHaveImage(messages) ? [4000, 8000, 12000, 16000] : [3000, 6000, 9000];
   for (let n = 0; ; n++) {
     try {
       return await _streamWithFallbackOnce(providers, messages, maxTokens, temperature, model, _tok, onDone);
