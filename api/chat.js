@@ -1373,7 +1373,7 @@ async function classifyNeedsFreshData(userText, providers) {
 // Il web parte SOLO se ATTUALITA (o se l'utente chiede esplicitamente di cercare qualcosa di esterno).
 // Se il router non risponde entro il timeout -> rete di sicurezza a parole chiave (come prima).
 // ══════════════════════════════════════════════════════════════════════
-const INTENT_ROUTER_PROMPT = `Sei un classificatore. Leggi l'ULTIMO messaggio dell'utente (il contesto precedente serve solo a capire i riferimenti come "e domani?", "grazie", "perché?") e rispondi con UNA riga JSON: {"i":"<CATEGORIA>","w":<true|false>}
+const INTENT_ROUTER_PROMPT = `Sei un classificatore. Leggi l'ULTIMO messaggio dell'utente (il contesto precedente serve solo a capire i riferimenti come "e domani?", "grazie", "perché?") e rispondi con UNA riga JSON: {"i":"<CATEGORIA>","w":<true|false>,"g":"<F|M|N>"}
 Categorie:
 PERSONALE = emozioni, solitudine, ansia, relazioni, famiglia, coppia, amicizie, lavoro vissuto come difficoltà, lutto, salute mentale, sfoghi, decisioni di vita, ringraziamenti, richieste di ascolto o di consiglio sulla propria vita. Anche se contiene "perché", "come", "ora", "oggi" o domande.
 ATTUALITA = serve il mondo di oggi: sport (partite, classifiche, calciomercato), meteo, notizie, gossip e vip, politica o economia correnti, prezzi, borsa, cripto, orari, uscite di film/prodotti, cariche attuali, eventi in corso.
@@ -1381,20 +1381,25 @@ STABILE = conoscenza che non cambia: storia, geografia, scienza, definizioni, sp
 COMPITO = scrivere, tradurre, riassumere, codice, analisi di un testo o file dell'utente.
 CHIACCHIERA = saluti, battute, domande sull'assistente.
 w = true SOLO per ATTUALITA, oppure se l'utente chiede esplicitamente di cercare/trovare qualcosa nel mondo esterno (un locale, un professionista, un indirizzo, un prezzo) anche dentro un discorso personale. Per PERSONALE, STABILE, COMPITO, CHIACCHIERA: w=false.
+g = genere grammaticale con cui l'utente parla di SE STESSO, deducibile SOLO da aggettivi, participi o sostantivi riferiti a se stesso in QUALUNQUE suo messaggio (es. "sono stanca", "mi sento sola", "ero preoccupato", "sono una mamma", "mi sono trasferita") oppure da una preferenza dichiarata esplicitamente ("scrivimi al femminile", "preferisco il neutro"). Valori: F, M, N. N = nessuna prova, forme senza genere ("mi sento giù", "ho paura"), oppure chiede il neutro. NON dedurlo MAI dal nome, dagli argomenti, dallo stile, dagli interessi o da persone citate ("mio marito", "mia moglie", "il mio ragazzo" non provano nulla).
 Esempi:
-"Perché non riesco a trovare un ragazzo? Mi sento non all'altezza" -> {"i":"PERSONALE","w":false}
-"Domani do le dimissioni, ho paura" -> {"i":"PERSONALE","w":false}
-"Mia madre non mi parla da giorni, che faccio?" -> {"i":"PERSONALE","w":false}
-"Come sta andando il Napoli?" -> {"i":"ATTUALITA","w":true}
-"Chi ha vinto ieri la Juve?" -> {"i":"ATTUALITA","w":true}
-"Che tempo fa domani a Gragnano?" -> {"i":"ATTUALITA","w":true}
-"Cosa è successo tra Fedez e Chiara?" -> {"i":"ATTUALITA","w":true}
-"Chi è il presidente del Consiglio?" -> {"i":"ATTUALITA","w":true}
-"Quando è caduto l'Impero romano?" -> {"i":"STABILE","w":false}
-"Qual è la capitale dell'Australia?" -> {"i":"STABILE","w":false}
-"Scrivimi una mail per il mio capo" -> {"i":"COMPITO","w":false}
-"Sono molto stressata, mi cerchi uno psicologo a Napoli?" -> {"i":"PERSONALE","w":true}
-"Grazie, mi hai aiutato tanto" -> {"i":"PERSONALE","w":false}
+"Perché non riesco a trovare un ragazzo? Mi sento non all'altezza" -> {"i":"PERSONALE","w":false,"g":"N"}
+"Domani do le dimissioni, ho paura" -> {"i":"PERSONALE","w":false,"g":"N"}
+"Mi sento sola da quando mi sono trasferita" -> {"i":"PERSONALE","w":false,"g":"F"}
+"Sono così stanco di tutto" -> {"i":"PERSONALE","w":false,"g":"M"}
+"Sono Andrea, ho un problema al lavoro" -> {"i":"PERSONALE","w":false,"g":"N"}
+"Mio marito non mi ascolta" -> {"i":"PERSONALE","w":false,"g":"N"}
+"Mia madre non mi parla da giorni, che faccio?" -> {"i":"PERSONALE","w":false,"g":"N"}
+"Come sta andando il Napoli?" -> {"i":"ATTUALITA","w":true,"g":"N"}
+"Chi ha vinto ieri la Juve?" -> {"i":"ATTUALITA","w":true,"g":"N"}
+"Che tempo fa domani a Gragnano?" -> {"i":"ATTUALITA","w":true,"g":"N"}
+"Cosa è successo tra Fedez e Chiara?" -> {"i":"ATTUALITA","w":true,"g":"N"}
+"Chi è il presidente del Consiglio?" -> {"i":"ATTUALITA","w":true,"g":"N"}
+"Quando è caduto l'Impero romano?" -> {"i":"STABILE","w":false,"g":"N"}
+"Qual è la capitale dell'Australia?" -> {"i":"STABILE","w":false,"g":"N"}
+"Scrivimi una mail per il mio capo" -> {"i":"COMPITO","w":false,"g":"N"}
+"Sono molto stressata, mi cerchi uno psicologo a Napoli?" -> {"i":"PERSONALE","w":true,"g":"N"}
+"Grazie, mi hai aiutato tanto" -> {"i":"PERSONALE","w":false,"g":"N"}
 Nessun altro testo.`;
 const intentRouterCache = new Map();
 async function routeIntent(messages, userText, providers) {
@@ -1402,7 +1407,8 @@ async function routeIntent(messages, userText, providers) {
   if (t.length < 2) return null;
   const hist = (messages || []).filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string');
   const prev = hist.slice(-3, -1).map(m => (m.role === 'user' ? 'U: ' : 'A: ') + m.content.slice(0, 220)).join('\n');
-  const input = (prev ? 'CONTESTO:\n' + prev + '\n\n' : '') + 'ULTIMO MESSAGGIO: ' + t.slice(0, 500);
+  const _um = hist.filter(m => m.role === 'user').slice(-6, -1).map(m => '- ' + m.content.replace(/---[\s\S]*?---/g, '').slice(0, 220)).join('\n');
+  const input = (prev ? 'CONTESTO:\n' + prev + '\n\n' : '') + (_um ? 'MESSAGGI PRECEDENTI DELL\'UTENTE (solo per il campo g):\n' + _um + '\n\n' : '') + 'ULTIMO MESSAGGIO: ' + t.slice(0, 500);
   const key = input.toLowerCase();
   if (intentRouterCache.has(key)) return intentRouterCache.get(key);
   let res = null;
@@ -1413,19 +1419,43 @@ async function routeIntent(messages, userText, providers) {
         [{ role: 'system', content: INTENT_ROUTER_PROMPT }, { role: 'user', content: input }],
         400, 0, ACTIVE_FAST
       ),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3500)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
     ]);
     const txt = String(r.text || '');
     const m = txt.match(/"i"\s*:\s*"(PERSONALE|ATTUALITA|STABILE|COMPITO|CHIACCHIERA)"/i);
     const w = txt.match(/"w"\s*:\s*(true|false)/i);
-    if (m) res = { intent: m[1].toUpperCase(), web: w ? w[1].toLowerCase() === 'true' : /ATTUALITA/i.test(m[1]) };
-    console.log('[AI] router intento: ' + (res ? res.intent + ' web=' + res.web : 'illeggibile') + ' <- "' + t.slice(0, 60) + '"');
+    const gm = txt.match(/"g"\s*:\s*"([FMN])"/i);
+    if (m) res = { intent: m[1].toUpperCase(), web: w ? w[1].toLowerCase() === 'true' : /ATTUALITA/i.test(m[1]), g: gm ? gm[1].toUpperCase() : 'N' };
+    console.log('[AI] router intento: ' + (res ? res.intent + ' web=' + res.web + ' g=' + res.g : 'illeggibile') + ' <- "' + t.slice(0, 60) + '"');
   } catch (e) {
     console.log('[AI] router intento non disponibile: ' + e.message);
     return null;
   }
   if (res) { if (intentRouterCache.size > 500) intentRouterCache.clear(); intentRouterCache.set(key, res); }
   return res;
+}
+
+
+// ── GENERE GRAMMATICALE DELL'UTENTE (2026-11-22) ──────────────────────
+// Regola di VinDimax: neutro finche' non ci sono prove; prove = solo come la persona parla di se' (specchio subito);
+// dal quarto messaggio, se non ci sono prove e la conversazione e' personale, UNA sola domanda facoltativa.
+// Mai nomi/argomenti/stile come prova. Mai forme con la barra (o/a, (a), e/o).
+const GENDER_ASK_MARK = 'al femminile, al maschile o in modo neutro';
+function genderNote(intent, messages, userText) {
+  const userMsgs = (messages || []).filter(m => m && m.role === 'user');
+  const turns = userMsgs.length;
+  const g = intent && intent.g ? intent.g : 'N';
+  const asked = (messages || []).some(m => m && m.role === 'assistant' && typeof m.content === 'string' && m.content.indexOf(GENDER_ASK_MARK) !== -1);
+  let n = '\n\nNota di sistema sul genere dell\'utente: ';
+  if (g === 'F') n += 'l\'utente ha parlato di sé al femminile (o ha chiesto il femminile): quando ti rivolgi a lei usa il femminile (stanca, sola, contenta...). Non dire mai che lo hai capito dal modo in cui scrive.';
+  else if (g === 'M') n += 'l\'utente ha parlato di sé al maschile (o ha chiesto il maschile): quando ti rivolgi a lui usa il maschile (stanco, solo, contento...). Non dire mai che lo hai capito dal modo in cui scrive.';
+  else {
+    n += 'non conosci il genere dell\'utente e NON devi dedurlo da nome, argomenti, interessi o stile. Quando ti rivolgi a lui o parli di lui, evita aggettivi, participi e sostantivi che marcano il genere, riformulando: ad esempio "un momento che ti ha dato soddisfazione" al posto di "un momento in cui ti sei sentito orgoglioso", "come ti senti?", "ce l\'hai fatta", "sei una persona che...". MAI le forme con la barra o le parentesi (sentito/a, (a), o/a, e/o). Non dire mai che stai evitando il genere.';
+    if (turns >= 4 && !asked && intent && intent.intent === 'PERSONALE') {
+      n += ' Questa è almeno la quarta richiesta e il tono è personale: solo se la risposta non è su dolore forte, lutto, paura, crisi o autolesionismo, puoi chiudere UNA SOLA VOLTA con una domanda gentile e facoltativa, in una frase, con queste parole: "Se ti va, come preferisci che ti scriva: ' + GENDER_ASK_MARK + '?". Non insistere se non risponde.';
+    }
+  }
+  return n;
 }
 
 // Seconda rete di sicurezza per Best-of-N: se i modelli ammettono di non avere dati
@@ -2099,7 +2129,8 @@ async function handlerCore(req) {
   let _intent = null;
   const _hardWeb = (scc && scc.connected && scc.web) || _newsWrite;
   const _canWeb = !noWeb && !_selfQ && !!tavilyKey && !messagesHaveImage(messages);
-  if (_canWeb && !_hardWeb) {
+  // il router gira anche senza ricerca web possibile: serve pure per il genere grammaticale dell'utente (g)
+  if (!_hardWeb && !_selfQ && !noWeb && body.simple !== true && !messagesHaveImage(messages)) {
     _intent = await routeIntent(messages, String(webQuery || userText || ''), providers);
   }
   if (_canWeb) {
@@ -2153,7 +2184,7 @@ async function handlerCore(req) {
   const sccNote = (scc && scc.connected && scc.topic)
     ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
     : '';
-  const realDateNoteFull = realDateNote + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '');
+  const realDateNoteFull = realDateNote + genderNote(_intent, messages, userText) + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '');
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
