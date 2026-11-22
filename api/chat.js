@@ -1362,6 +1362,72 @@ async function classifyNeedsFreshData(userText, providers) {
   return res;
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// ROUTER DI INTENTO SEMANTICO (2026-11-22) — vale per Sofia, Elia, AInstAIn
+// Il modello legge il SENSO del messaggio (con l'ultimo scambio come contesto) e decide:
+//   PERSONALE  = emozioni, relazioni, famiglia, lavoro vissuto, salute mentale, sfoghi, ringraziamenti, richieste di ascolto/consiglio sulla propria vita
+//   ATTUALITA  = serve il mondo di oggi: sport, meteo, news, gossip, politica/economia correnti, prezzi, orari, cariche attuali, eventi
+//   STABILE    = conoscenza che non cambia: storia, geografia, scienza, spiegazioni, matematica, definizioni
+//   COMPITO    = scrivere, tradurre, codice, riassunti, analisi di testo/file dell'utente
+//   CHIACCHIERA= saluti, battute, domande su di te/sull'assistente
+// Il web parte SOLO se ATTUALITA (o se l'utente chiede esplicitamente di cercare qualcosa di esterno).
+// Se il router non risponde entro il timeout -> rete di sicurezza a parole chiave (come prima).
+// ══════════════════════════════════════════════════════════════════════
+const INTENT_ROUTER_PROMPT = `Sei un classificatore. Leggi l'ULTIMO messaggio dell'utente (il contesto precedente serve solo a capire i riferimenti come "e domani?", "grazie", "perché?") e rispondi con UNA riga JSON: {"i":"<CATEGORIA>","w":<true|false>}
+Categorie:
+PERSONALE = emozioni, solitudine, ansia, relazioni, famiglia, coppia, amicizie, lavoro vissuto come difficoltà, lutto, salute mentale, sfoghi, decisioni di vita, ringraziamenti, richieste di ascolto o di consiglio sulla propria vita. Anche se contiene "perché", "come", "ora", "oggi" o domande.
+ATTUALITA = serve il mondo di oggi: sport (partite, classifiche, calciomercato), meteo, notizie, gossip e vip, politica o economia correnti, prezzi, borsa, cripto, orari, uscite di film/prodotti, cariche attuali, eventi in corso.
+STABILE = conoscenza che non cambia: storia, geografia, scienza, definizioni, spiegazioni, matematica, cultura generale.
+COMPITO = scrivere, tradurre, riassumere, codice, analisi di un testo o file dell'utente.
+CHIACCHIERA = saluti, battute, domande sull'assistente.
+w = true SOLO per ATTUALITA, oppure se l'utente chiede esplicitamente di cercare/trovare qualcosa nel mondo esterno (un locale, un professionista, un indirizzo, un prezzo) anche dentro un discorso personale. Per PERSONALE, STABILE, COMPITO, CHIACCHIERA: w=false.
+Esempi:
+"Perché non riesco a trovare un ragazzo? Mi sento non all'altezza" -> {"i":"PERSONALE","w":false}
+"Domani do le dimissioni, ho paura" -> {"i":"PERSONALE","w":false}
+"Mia madre non mi parla da giorni, che faccio?" -> {"i":"PERSONALE","w":false}
+"Come sta andando il Napoli?" -> {"i":"ATTUALITA","w":true}
+"Chi ha vinto ieri la Juve?" -> {"i":"ATTUALITA","w":true}
+"Che tempo fa domani a Gragnano?" -> {"i":"ATTUALITA","w":true}
+"Cosa è successo tra Fedez e Chiara?" -> {"i":"ATTUALITA","w":true}
+"Chi è il presidente del Consiglio?" -> {"i":"ATTUALITA","w":true}
+"Quando è caduto l'Impero romano?" -> {"i":"STABILE","w":false}
+"Qual è la capitale dell'Australia?" -> {"i":"STABILE","w":false}
+"Scrivimi una mail per il mio capo" -> {"i":"COMPITO","w":false}
+"Sono molto stressata, mi cerchi uno psicologo a Napoli?" -> {"i":"PERSONALE","w":true}
+"Grazie, mi hai aiutato tanto" -> {"i":"PERSONALE","w":false}
+Nessun altro testo.`;
+const intentRouterCache = new Map();
+async function routeIntent(messages, userText, providers) {
+  const t = String(userText || '').replace(/---[\s\S]*?---/g, '').trim();
+  if (t.length < 2) return null;
+  const hist = (messages || []).filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string');
+  const prev = hist.slice(-3, -1).map(m => (m.role === 'user' ? 'U: ' : 'A: ') + m.content.slice(0, 220)).join('\n');
+  const input = (prev ? 'CONTESTO:\n' + prev + '\n\n' : '') + 'ULTIMO MESSAGGIO: ' + t.slice(0, 500);
+  const key = input.toLowerCase();
+  if (intentRouterCache.has(key)) return intentRouterCache.get(key);
+  let res = null;
+  try {
+    const r = await Promise.race([
+      callWithFallback(
+        [{ ...providers[0], model: ACTIVE_FAST }, ...providers.slice(1)],
+        [{ role: 'system', content: INTENT_ROUTER_PROMPT }, { role: 'user', content: input }],
+        400, 0, ACTIVE_FAST
+      ),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3500)),
+    ]);
+    const txt = String(r.text || '');
+    const m = txt.match(/"i"\s*:\s*"(PERSONALE|ATTUALITA|STABILE|COMPITO|CHIACCHIERA)"/i);
+    const w = txt.match(/"w"\s*:\s*(true|false)/i);
+    if (m) res = { intent: m[1].toUpperCase(), web: w ? w[1].toLowerCase() === 'true' : /ATTUALITA/i.test(m[1]) };
+    console.log('[AI] router intento: ' + (res ? res.intent + ' web=' + res.web : 'illeggibile') + ' <- "' + t.slice(0, 60) + '"');
+  } catch (e) {
+    console.log('[AI] router intento non disponibile: ' + e.message);
+    return null;
+  }
+  if (res) { if (intentRouterCache.size > 500) intentRouterCache.clear(); intentRouterCache.set(key, res); }
+  return res;
+}
+
 // Seconda rete di sicurezza per Best-of-N: se i modelli ammettono di non avere dati
 // aggiornati, oppure sui numeri (punteggi, prezzi, date) sono in netto disaccordo,
 // il dato quasi certamente e' "in tempo reale": si cerca sul web prima della sintesi.
@@ -2027,9 +2093,24 @@ async function handlerCore(req) {
   const PERSONAL_MSG_RE = /(?:^|[^a-zà-ù])(mi sento|mi sentivo|non riesco|non ce la faccio|ho paura|ho ansia|mi vergogno|mi manca|mi manchi|mi hanno (?:lasciat|licenziat)|mi ha (?:lasciat|tradit|licenziat)|sono (?:molto |così |troppo |davvero )?(?:triste|sola|solo|stanc|esaust|agitat|ansios|spaventat|giù|arrabbiat|furios|preoccupat|stressat|depress|disperat|in ansia)|ansia|panico|depressione|lutto|piango|solitudine|autostima|grazie|ti ringrazio|mi sei stat|aiutami|farla finita|mio (?:padre|marito|figlio|fratello|capo)|mia (?:madre|moglie|figlia|sorella|suocera)|il mio (?:ragazzo|compagno|partner|capo|ex)|la mia (?:ragazza|compagna|amica|ex|migliore amica)|non all.altezza|anniversario della morte|ho litigato|abbiamo litigato)(?![a-zà-ù])/i;
   const EXPLICIT_WEB_RE = /(?:^|[^a-zà-ù])(notizie|news|meteo|previsioni|classifica|risultati|partita|borsa|bitcoin|prezzo|prezzi|quanto costa|cerca|cercami|ricerca|elezioni|orari|programmazione|cinema|farmacia|ristorant\w*)(?![a-zà-ù])/i;
   const _personalMsg = PERSONAL_MSG_RE.test(String(userText || '')) && !EXPLICIT_WEB_RE.test(String(userText || ''));
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && ((forceWeb && !_personalMsg && (!_sofiaP || EXPLICIT_WEB_RE.test(String(userText || '')))) || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(String(webQuery || userText || '')) : WEB_TRIGGERS.some(re => re.test(searchText))));
-  if (!noWeb && !_selfQ && !_sofiaP && !_personalMsg && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
-    needsWeb = await classifyNeedsFreshData(searchText, providers);
+  // 2026-11-22: DECIDE IL MODELLO (router di intento), le parole chiave sono solo rete di sicurezza.
+  // Prima del web: se il messaggio e' PERSONALE/STABILE/COMPITO/CHIACCHIERA con w=false, niente ricerca, nemmeno con webSearch:true dal client.
+  let needsWeb = false;
+  let _intent = null;
+  const _hardWeb = (scc && scc.connected && scc.web) || _newsWrite;
+  const _canWeb = !noWeb && !_selfQ && !!tavilyKey && !messagesHaveImage(messages);
+  if (_canWeb && !_hardWeb) {
+    _intent = await routeIntent(messages, String(webQuery || userText || ''), providers);
+  }
+  if (_canWeb) {
+    if (_hardWeb) needsWeb = true;
+    else if (_intent) needsWeb = _intent.web === true;
+    else {
+      // router non disponibile -> regole a parole chiave (comportamento precedente + filtro personale)
+      needsWeb = (forceWeb && !_personalMsg && (!_sofiaP || EXPLICIT_WEB_RE.test(String(userText || '')))) ||
+        (_sofiaP ? SOFIA_WEB_RE.test(String(webQuery || userText || '')) : WEB_TRIGGERS.some(re => re.test(searchText)));
+      if (!needsWeb && !_sofiaP && !_personalMsg && body.stream !== false) needsWeb = await classifyNeedsFreshData(searchText, providers);
+    }
   }
   // ── 2026-10-20: tetto ricerche web (globale e per utente). Oltre il tetto si risponde senza web, dichiarandolo. ──
   let webCapNote = '';
