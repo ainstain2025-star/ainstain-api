@@ -192,7 +192,7 @@ const WEB_TRIGGERS = [
   /\b(2024|2025|2026)\b/,
   /\b(today|now|current|currently|latest|recent|news)\b/i,
   /\b(chi è|chi sono|cos'è|dov'è|quando è|quanto costa)\b/i,
-  /\b(meteo|tempo|temperatura|previsioni)\b/i,
+  /\b(meteo|(?:che|il|col|brutto|bel) tempo|temperatura|previsioni)\b/i,
   /\b(classifica|ranking|risultati|vincitore|campione|partita|gol)\b/i,
   /\b(borsa|azioni|bitcoin|crypto|euro|dollaro)\b/i,
   /\b(elezioni|governo|presidente|premier|ministro)\b/i,
@@ -2022,8 +2022,13 @@ async function handlerCore(req) {
   // su richiesta esplicita (forceWeb/scc) o con parole forti di dati vivi, e il classificatore semantico non viene usato.
   const _sofiaP = (messages || []).some(m => m && m.role === 'system' && typeof m.content === 'string' && m.content.indexOf("Sei Sofia, l'assistente AI") !== -1);
   const SOFIA_WEB_RE = /\b(notizie|news|meteo|previsioni|classifica|risultati|partita|borsa|bitcoin|prezzo|prezzi|quanto costa|cerca|ricerca|elezioni|orari|programmazione|cinema)\b/i;
-  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && (forceWeb || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(String(webQuery || userText || '')) : WEB_TRIGGERS.some(re => re.test(searchText))));
-  if (!noWeb && !_selfQ && !_sofiaP && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
+  // 2026-11-22: messaggi personali (emozioni, famiglia, ringraziamenti) non fanno mai partire la ricerca automatica, nemmeno se
+  // un sito vecchio in cache manda webSearch:true. Le parole esplicite di attualita' (notizie, meteo, classifica...) restano valide.
+  const PERSONAL_MSG_RE = /(?:^|[^a-zà-ù])(mi sento|mi sentivo|non riesco|non ce la faccio|ho paura|ho ansia|mi vergogno|mi manca|mi manchi|mi hanno (?:lasciat|licenziat)|mi ha (?:lasciat|tradit|licenziat)|sono (?:molto |così |troppo |davvero )?(?:triste|sola|solo|stanc|esaust|agitat|ansios|spaventat|giù|arrabbiat|furios|preoccupat|stressat|depress|disperat|in ansia)|ansia|panico|depressione|lutto|piango|solitudine|autostima|grazie|ti ringrazio|mi sei stat|aiutami|farla finita|mio (?:padre|marito|figlio|fratello|capo)|mia (?:madre|moglie|figlia|sorella|suocera)|il mio (?:ragazzo|compagno|partner|capo|ex)|la mia (?:ragazza|compagna|amica|ex|migliore amica)|non all.altezza|anniversario della morte|ho litigato|abbiamo litigato)(?![a-zà-ù])/i;
+  const EXPLICIT_WEB_RE = /(?:^|[^a-zà-ù])(notizie|news|meteo|previsioni|classifica|risultati|partita|borsa|bitcoin|prezzo|prezzi|quanto costa|cerca|cercami|ricerca|elezioni|orari|programmazione|cinema|farmacia|ristorant\w*)(?![a-zà-ù])/i;
+  const _personalMsg = PERSONAL_MSG_RE.test(String(userText || '')) && !EXPLICIT_WEB_RE.test(String(userText || ''));
+  let needsWeb = !noWeb && !_selfQ && !!tavilyKey && ((forceWeb && !_personalMsg && (!_sofiaP || EXPLICIT_WEB_RE.test(String(userText || '')))) || (scc && scc.connected && scc.web) || _newsWrite || (_sofiaP ? SOFIA_WEB_RE.test(String(webQuery || userText || '')) : WEB_TRIGGERS.some(re => re.test(searchText))));
+  if (!noWeb && !_selfQ && !_sofiaP && !_personalMsg && !needsWeb && tavilyKey && body.stream !== false && !messagesHaveImage(messages)) {
     needsWeb = await classifyNeedsFreshData(searchText, providers);
   }
   // ── 2026-10-20: tetto ricerche web (globale e per utente). Oltre il tetto si risponde senza web, dichiarandolo. ──
