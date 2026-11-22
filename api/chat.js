@@ -1230,7 +1230,7 @@ async function _streamWithFallbackOnce(providers, messages, maxTokens, temperatu
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
         body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true, ...(p.extraBody || {}) }),
       });
-      if (res.status === 429 || res.status === 503) { console.log('[AI] ' + p.name + ' rate limited, next...'); why.push(p.name + ' sovraccarico (' + res.status + ')'); continue; }
+      if (res.status === 429 || res.status === 503) { let _m = ''; try { _m = (await res.text()).replace(/\s+/g, ' ').slice(0, 160); } catch {} console.log('[AI] ' + p.name + ' rate limited, next... ' + _m); why.push(p.name + ' sovraccarico (' + res.status + ')' + (_m ? ' ' + _m : '')); continue; }
       if (!res.ok) {
         const errBody = await res.text().catch(() => '');
         let readableMsg = errBody.slice(0, 200);
