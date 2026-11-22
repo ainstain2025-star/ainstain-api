@@ -1195,7 +1195,25 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 }
 
 // ── Streaming con fallback ────────────────────────────────────────────
+// 2026-11-22: foto/esercizi: Groq (modello foto) e OpenRouter rispondono 429 a richieste ravvicinate e l'utente vedeva "servizio non riuscito".
+// Se TUTTI i provider hanno risposto solo 429/503 e nessun testo e' partito, si attende qualche secondo e si riprova (fino a 3 volte).
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
+  let _emittedAny = false;
+  const _tok = (t) => { _emittedAny = true; onToken(t); };
+  const waits = [3000, 6000, 9000];
+  for (let n = 0; ; n++) {
+    try {
+      return await _streamWithFallbackOnce(providers, messages, maxTokens, temperature, model, _tok, onDone);
+    } catch (e) {
+      const w = e && e.why;
+      const onlyBusy = Array.isArray(w) && w.length > 0 && w.every(x => /\((?:429|503)\)|sovraccarico/i.test(String(x)));
+      if (_emittedAny || !onlyBusy || n >= waits.length) throw e;
+      console.log('[AI] tutti i provider occupati (' + w.join(' | ') + '): attendo ' + waits[n] + ' ms e ritento (' + (n + 1) + '/' + waits.length + ')');
+      await new Promise(r => setTimeout(r, waits[n]));
+    }
+  }
+}
+async function _streamWithFallbackOnce(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   const why = [];
   const want = { provider: providers[0] && providers[0].name, model: model || (providers[0] && providers[0].model) };
   let _invalidRetries = 0; // 2026-11-22: risposta vuota/non valida dell'ULTIMO provider -> si ritenta (il selettore casuale di OpenRouter cambia modello)
