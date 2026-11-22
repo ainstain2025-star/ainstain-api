@@ -1198,6 +1198,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
   const why = [];
   const want = { provider: providers[0] && providers[0].name, model: model || (providers[0] && providers[0].model) };
+  let _invalidRetries = 0; // 2026-11-22: risposta vuota/non valida dell'ULTIMO provider -> si ritenta (il selettore casuale di OpenRouter cambia modello)
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato (stream): account bloccato'); continue; }
@@ -1314,6 +1315,10 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
     } catch(e) {
       console.log('[AI] ' + p.name + ' stream error: ' + e.message);
       why.push(String(e.message).slice(0, 90));
+      if (p === providers[providers.length - 1] && _invalidRetries < 3 && /non valida|moderazione/i.test(String(e.message))) {
+        _invalidRetries++; console.log('[AI] ' + p.name + ': risposta non valida, nuovo tentativo ' + _invalidRetries + '/3');
+        i--; continue;
+      }
       if (p === providers[providers.length - 1]) throw e;
     }
   }
@@ -1458,6 +1463,29 @@ function genderNote(intent, messages, userText) {
   return n;
 }
 
+
+// ── NUMERI DI AIUTO VERIFICATI (2026-11-22) ───────────────────────────
+// Fonti: Telefono Amico Italia (telefonoamico.it, comunicati 2024), elenco nazionale findahelpline.com/it.
+// Valgono per Sofia, Elia e AInstAIn. I modelli NON devono mai scrivere altri numeri.
+const HELP_NUMBERS_LINE = 'Emergenza immediata 112 (sanitaria 118); Telefono Amico Italia 02 2327 2327 (anche WhatsApp 324 011 7252), gratuito, tutti i giorni; Samaritans 06 77208977 (ogni giorno dalle 13 alle 22); violenza o stalking 1522; minori: Telefono Azzurro 19696 e 114 emergenza infanzia';
+const CRISIS_RE = /(farla finita|farmi del male|mi uccido|uccidermi|ammazzarmi|togliermi la vita|suicid|non voglio pi[uù] vivere|voglio morire|vorrei morire|meglio se non ci fossi|autolesion|mi taglio|non ce la faccio pi[uù]|pensieri di morte)/i;
+const ABUSE_RE = /(mi (?:ha )?(?:picchia|schiaffegg|minaccia|perseguita)|schiaff|botte|violenza|abus|stalking|maltratt)/i;
+function helpNote(intent, messages, userText) {
+  const um = (messages || []).filter(m => m && m.role === 'user').slice(-2).map(m => String(m.content || '')).join(' ') + ' ' + String(userText || '');
+  const crisis = CRISIS_RE.test(um), abuse = ABUSE_RE.test(um);
+  let n = '';
+  if (crisis || abuse) {
+    n += '\n\nNota di sistema - NUMERI DI AIUTO VERIFICATI (usa SOLO questi, mai altri numeri e mai numeri inventati o a memoria): ' + HELP_NUMBERS_LINE + '. ';
+    n += 'La persona potrebbe essere in difficoltà seria: prima ascolta con calore e in modo specifico (2-3 frasi, ciò che ha detto davvero, senza frasi fatte), poi di\' che non deve restare sola; se c\'è pericolo adesso dai il 112, altrimenti Telefono Amico Italia ';
+    n += (abuse ? 'e, per violenza o stalking, il 1522; se è una persona minorenne il 19696. ' : '; invita anche a cercare una persona vicina. ');
+    n += 'Mai freddezza, mai solo un elenco di numeri, mai consigli generici, niente emoji, niente elenchi puntati, niente grassetto tranne i numeri di aiuto.';
+  } else if (intent && intent.intent === 'PERSONALE') {
+    n += '\n\nNota di sistema: se in questa risposta citi un numero di aiuto, usa SOLO questi (mai altri): ' + HELP_NUMBERS_LINE + '.';
+  }
+  return n;
+}
+// Messaggio fisso se TUTTI i modelli falliscono su un messaggio di crisi: la persona non resta mai senza risposta
+const CRISIS_FALLBACK_TEXT = 'Mi dispiace, ho avuto un problema tecnico proprio adesso, ma non voglio lasciarti senza una risposta. Quello che stai vivendo conta. Se stai pensando di farti del male o sei in pericolo, chiama subito il 112. Puoi anche parlare con una persona vera di Telefono Amico Italia al 02 2327 2327 (anche su WhatsApp al 324 011 7252). Scrivimi di nuovo tra un momento: sono qui.';
 // Seconda rete di sicurezza per Best-of-N: se i modelli ammettono di non avere dati
 // aggiornati, oppure sui numeri (punteggi, prezzi, date) sono in netto disaccordo,
 // il dato quasi certamente e' "in tempo reale": si cerca sul web prima della sintesi.
@@ -2184,7 +2212,7 @@ async function handlerCore(req) {
   const sccNote = (scc && scc.connected && scc.topic)
     ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
     : '';
-  const realDateNoteFull = realDateNote + genderNote(_intent, messages, userText) + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '');
+  const realDateNoteFull = realDateNote + genderNote(_intent, messages, userText) + helpNote(_intent, messages, userText) + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '');
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
@@ -2861,11 +2889,29 @@ async function handlerCore(req) {
             { role: 'assistant', content: acc.slice(-4000) },
             { role: 'user', content: 'La tua risposta si è interrotta per il limite di lunghezza. Riprendi ESATTAMENTE dal punto in cui ti sei fermato (anche a metà frase), senza ripetere nulla di ciò che hai già scritto, senza introduzioni e senza scusarti. Mantieni lo stesso formato e la stessa lingua, e completa tutto ciò che la richiesta iniziale chiedeva.' }];
         }
-        await streamWithFallback(providers, msgs, maxTokens, temperature, smartModel,
+        const _runStream = () => streamWithFallback(providers, msgs, maxTokens, temperature, smartModel,
           tok => { acc += tok; send({ type: 'token', token: tok }); },
           // FIX 2026-09-19: propaga quale modello/provider ha risposto davvero (tag discreto in UI e diagnosi senza aprire i log)
           (r, i) => { reason = r; info = i; }
         );
+        try {
+          try { await _runStream(); }
+          catch (e1) {
+            // 2026-11-22: se non e' uscito nulla, un secondo giro completo prima di arrendersi
+            if (acc) throw e1;
+            console.log('[AI] stream fallito senza testo (' + e1.message + '): secondo giro completo');
+            await _runStream();
+          }
+          // risposta vuota ma senza errori (es. blocco silenzioso): stesso trattamento
+          if (!acc.trim() && !reason) throw new Error('risposta vuota');
+        } catch (e2) {
+          if (acc) throw e2;
+          const _um = (messages || []).filter(m => m && m.role === 'user').slice(-2).map(m => String(m.content || '')).join(' ');
+          if (CRISIS_RE.test(_um) || ABUSE_RE.test(_um)) {
+            console.log('[AI] tutti i modelli falliti su messaggio di crisi: invio il messaggio fisso con i numeri di aiuto');
+            acc = CRISIS_FALLBACK_TEXT; send({ type: 'token', token: CRISIS_FALLBACK_TEXT }); reason = 'done';
+          } else throw e2;
+        }
         lastInfo = info || lastInfo;
         if (reason === 'truncated' && cont < maxCont && acc.length > 200) {
           cont++; console.log('[AI] risposta troncata: ripresa automatica ' + cont + '/' + maxCont + ' (' + acc.length + ' caratteri finora)');
