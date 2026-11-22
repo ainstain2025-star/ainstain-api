@@ -1198,6 +1198,8 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
 // 2026-11-22: foto/esercizi: Groq (modello foto) e OpenRouter rispondono 429 a richieste ravvicinate e l'utente vedeva "servizio non riuscito".
 // Se TUTTI i provider hanno risposto solo 429/503 e nessun testo e' partito, si attende qualche secondo e si riprova (fino a 3 volte).
 async function streamWithFallback(providers, messages, maxTokens, temperature, model, onToken, onDone) {
+  // Groq conta max_tokens nel limite di token in uscita al minuto del modello foto: per le foto si tiene un tetto prudente (errore "Request too large ... output tokens per minute")
+  if (messagesHaveImage(messages)) maxTokens = Math.min(maxTokens || 1800, 1800);
   let _emittedAny = false;
   const _tok = (t) => { _emittedAny = true; onToken(t); };
   const waits = [3000, 6000, 9000];
