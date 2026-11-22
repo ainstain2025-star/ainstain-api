@@ -1480,7 +1480,7 @@ function helpNote(intent, messages, userText) {
     n += (abuse ? 'e, per violenza o stalking, il 1522; se è una persona minorenne il 19696. ' : '; invita anche a cercare una persona vicina. ');
     n += 'Mai freddezza, mai solo un elenco di numeri, mai consigli generici, niente emoji, niente elenchi puntati, niente grassetto tranne i numeri di aiuto.';
   } else if (intent && intent.intent === 'PERSONALE') {
-    n += '\n\nNota di sistema: se in questa risposta citi un numero di aiuto, usa SOLO questi (mai altri): ' + HELP_NUMBERS_LINE + '.';
+    n += '\n\nNota di sistema: la persona NON ha parlato di farsi del male, suicidio, violenza o emergenza, quindi NON citare numeri di telefono, linee di ascolto o servizi di emergenza (niente Telefono Amico, Samaritans, 112): ascolta, rispondi alla sua situazione concreta e, se serve, suggerisci in parole una persona di fiducia o un professionista. Se invece nel messaggio compare un reale pericolo, usa SOLO questi numeri (mai altri): ' + HELP_NUMBERS_LINE + '.';
   }
   return n;
 }
