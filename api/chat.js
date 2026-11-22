@@ -904,7 +904,7 @@ function makeSSE(fn) {
       // FIX: prima, se fn() falliva (es. tutti i provider AI non disponibili),
       // lo stream si chiudeva silenziosamente senza mandare nulla al client,
       // che restava con una bolla vuota senza nessun messaggio di errore.
-      try { send({ type: 'error', message: e && e.message ? e.message : 'Errore imprevisto del server.' }); } catch {}
+      try { send({ type: 'error', message: e && e.message ? e.message : 'Errore imprevisto del server.', ...(e && e.why ? { detail: e.why } : {}) }); } catch {}
     } finally {
       w.close();
     }
@@ -1324,7 +1324,7 @@ async function streamWithFallback(providers, messages, maxTokens, temperature, m
   }
   // FIX 2026-10-16: se TUTTI i provider rispondono 429/503 il ciclo finiva in silenzio e al client arrivava una risposta vuota
   // (solo "meta"). Ora l'errore sale e makeSSE manda un evento 'error' leggibile.
-  throw new Error('Il servizio è temporaneamente al limite di capacità: riprova tra un minuto. Se persiste, scrivici dal sito.');
+  { const _le = new Error('Il servizio è temporaneamente al limite di capacità: riprova tra un minuto. Se persiste, scrivici dal sito.'); _le.why = why.slice(0, 8); throw _le; }
 }
 
 // ════════════════════════════════════════════════════════════════════════
