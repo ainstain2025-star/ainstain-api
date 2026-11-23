@@ -3042,7 +3042,7 @@ async function handlerCore(req) {
           cont++; console.log('[AI] risposta troncata: ripresa automatica ' + cont + '/' + maxCont + ' (' + acc.length + ' caratteri finora)');
           continue;
         }
-        send({ type: reason || 'done', model: (info || lastInfo)?.model, provider: (info || lastInfo)?.provider, alert: buildAlert(info || lastInfo) });
+        send({ type: reason || 'done', model: (info || lastInfo)?.model, provider: (info || lastInfo)?.provider, alert: buildAlert(info || lastInfo), ...(((info || lastInfo)?.why || []).length ? { why: (info || lastInfo).why.slice(0, 6) } : {}) });
         break;
       }
     });
