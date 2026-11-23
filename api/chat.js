@@ -33,7 +33,7 @@ const PROVIDER_CHAIN = [
   // Tetti gratuiti verificati il 2026-10-25: SambaNova 20 richieste e 200.000 token/giorno; Mistral e Gemini limiti non pubblicati.
   // Se uno risponde 429/503/errore, il codice passa al successivo senza mostrare nulla all'utente.
   { name: 'SambaNova',  url: 'https://api.sambanova.ai/v1/chat/completions',                         model: 'DeepSeek-V3.1',                              keyEnv: 'SAMBANOVA_API_KEY', noDocs: true },
-  { name: 'Mistral',    url: 'https://api.mistral.ai/v1/chat/completions',                           model: 'mistral-small-latest',                       keyEnv: 'MISTRAL_API_KEY',   noDocs: true },
+  { name: 'Mistral',    url: 'https://api.mistral.ai/v1/chat/completions',                           model: 'mistral-small-latest',                       keyEnv: 'MISTRAL_API_KEY',   noDocs: true, exImg: true },
   { name: 'Gemini',     url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: 'gemini-3.8-flash',                       keyEnv: 'GEMINI_API_KEY',    noDocs: true },
   { name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',         model: 'openrouter/free',                            keyEnv: 'OPENROUTER_API_KEY', extraHeaders: { 'HTTP-Referer': 'https://ainstain.site', 'X-Title': 'AInstAIn' } },
 ];
@@ -892,6 +892,28 @@ function hasAttachedDoc(messages) {
     (Array.isArray(m.content) && m.content.some(c => c && c.type === 'image_url'))); // anche le foto degli utenti
 }
 
+// 2026-11-23: foto di ESERCIZI (fisica, matematica) possono andare anche a Mistral (non agli altri provider gratuiti) se il testo che le accompagna
+// chiede di risolvere/spiegare un esercizio e non contiene parole da contenuto personale. Tutto il resto resta solo su Groq/OpenRouter.
+const EX_IMG_RE = /\b(risolv\w*|esercizi\w*|problem[ai]|calcol\w*|svolg\w*|passo\s+passo|dimostr\w*|equazion\w*|disequazion\w*|derivat\w*|integral\w*|limit[ei]|traccia|compito)\b/i;
+const PERS_IMG_RE = /\b(bolletta|bollette|contratto|referto|fattura|multa|lettera|documento|codice\s+fiscale|iban|carta\s+d['’]?identit\w*|passaporto|patente|ricetta|analisi|cartella\s+clinica|busta\s+paga|cedolino|estratto\s+conto|bonifico|firma|volto|faccia|selfie|persona|nome|cognome|indirizzo|password|pin|tessera|certificato|diagnosi|radiografia|ecografia)\b/i;
+function exerciseImageOnly(messages) {
+  if (!messagesHaveImage(messages)) return false;
+  const lastUser = [...(messages || [])].reverse().find(m => m.role === 'user');
+  if (!lastUser) return false;
+  const txtOf = m => typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.filter(c => c && c.type === 'text').map(c => c.text).join(' ') : '');
+  const lastTxt = txtOf(lastUser);
+  if (!EX_IMG_RE.test(lastTxt)) return false;
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    const t = txtOf(m);
+    if (t.indexOf('[DOCUMENTO ALLEGATO') !== -1 || PERS_IMG_RE.test(t)) return false;
+  }
+  return true;
+}
+function mistralImgMsgs(msgs) {
+  return msgs.map(m => Array.isArray(m.content) ? { ...m, content: m.content.map(c => (c && c.type === 'image_url' && c.image_url && typeof c.image_url === 'object') ? { type: 'image_url', image_url: c.image_url.url } : c) } : m);
+}
+
 function makeSSE(fn) {
   const { readable, writable } = new TransformStream();
   const w = writable.getWriter();
@@ -1086,7 +1108,7 @@ async function callWithFallback(providers, messages, maxTokens, temperature, mod
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato: account bloccato'); continue; }
-    if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato: documento allegato'); continue; }
+    if (p.noDocs && hasAttachedDoc(messages) && !(p.exImg && exerciseImageOnly(messages))) { console.log('[AI] ' + p.name + ' saltato: documento allegato'); continue; }
     // FIX BUG CRITICO: prima "model || p.model" usava lo stesso nome
     // modello per TUTTI i provider — ma ogni provider ha una propria
     // nomenclatura (es. Groq: "llama-3.3-70b-versatile", OpenRouter:
@@ -1222,15 +1244,17 @@ async function _streamWithFallbackOnce(providers, messages, maxTokens, temperatu
   for (let i = 0; i < providers.length; i++) {
     const p = providers[i];
     if (isSkippedBlocked(p.name)) { console.log('[AI] ' + p.name + ' saltato (stream): account bloccato'); continue; }
-    if (p.noDocs && hasAttachedDoc(messages)) { console.log('[AI] ' + p.name + ' saltato (stream): documento allegato'); continue; }
+    if (p.noDocs && hasAttachedDoc(messages) && !(p.exImg && exerciseImageOnly(messages))) { console.log('[AI] ' + p.name + ' saltato (stream): documento allegato'); continue; }
     const fit = i === 0 ? fitForGroq(messages, maxTokens) : { messages, maxTokens };
     const requestedModel = i === 0 ? (model || p.model) : p.model;
     let useModel = i === 0 ? resolveUsableModel(requestedModel, messages) : requestedModel;
+    const _exImgHere = !!(p.exImg && messagesHaveImage(messages));
+    if (_exImgHere) { useModel = process.env.MISTRAL_VISION_MODEL || 'mistral-small-latest'; console.log('[AI] foto di esercizio: provo ' + p.name + ' (' + useModel + ')'); }
     try {
       let res = await fetch(p.url, {
         method: 'POST',
         headers: { 'Authorization': 'Bearer ' + p.apiKey, 'Content-Type': 'application/json', ...(p.extraHeaders || {}) },
-        body: JSON.stringify({ model: useModel, messages: fit.messages, max_tokens: fit.maxTokens, temperature, stream: true, ...(p.extraBody || {}) }),
+        body: JSON.stringify({ model: useModel, messages: _exImgHere ? mistralImgMsgs(fit.messages) : fit.messages, max_tokens: fit.maxTokens, temperature, stream: true, ...(p.extraBody || {}) }),
       });
       if (res.status === 429 || res.status === 503) { let _m = ''; try { _m = (await res.text()).replace(/\s+/g, ' ').slice(0, 160); } catch {} console.log('[AI] ' + p.name + ' rate limited, next... ' + _m); why.push(p.name + ' sovraccarico (' + res.status + ')' + (_m ? ' ' + _m : '')); continue; }
       if (!res.ok) {
