@@ -1760,6 +1760,53 @@ const CITY_IN_TEXT_RE = /\b(?:a|ad|in|di|su|per|presso|near|in)\s+[A-ZÀ-Ý][\p{
 const CINEMA_RE = /\b(cinema|al cinema|film in sala|programmazione\s+(?:cinema|film)|spettacol\w+|teatro|concert[oi])\b/i;
 const PHYS_RE = /(\b\d+[.,]?\d*\s*(?:m\/s|km\/h|kg|N\b|J\b|W\b|Hz|V\b|A\b|Ω|ohm|°C|K\b|mol|T\b|nC|μC|µC|mF|μF|µF|cm|mm)\b)|\b(velocit[àa]|accelerazion|forza|energia|lavoro|potenza|corrente|resistenz|campo (?:elettrico|magnetico)|carica|condensator|lente|pendolo|urto|calore|gas ideale|onda|lunghezza d'onda|attrito|piano inclinato|moto|fisica|problema di fisica|equazione|derivata|integrale|limite|polinomio|disequazione|trigonometri|logaritm|probabilit[àa]|geometria analitica)\b/i;
 const PHYS_NOTE = '\n\nPROBLEMI DI FISICA E MATEMATICA: ragiona passo per passo ma in modo compatto: 1) dati con unità, 2) formula, 3) sostituzione con i numeri, 4) risultato con unità e cifre significative adeguate. Fai i conti con molta attenzione, rifai mentalmente l\'operazione finale e controlla le conversioni di unità e dei prefissi (p=10^-12, n=10^-9, μ=10^-6, m=10^-3, k=10^3, M=10^6) e l\'ordine di grandezza. Usa i valori delle costanti che il testo fornisce. Scrivi le formule in LaTeX: $...$ nel testo e $$...$$ per quelle in evidenza (mai \\[ \\]), con \\text{} per le unità. Non usare emoji nei calcoli.';
+
+// ── Calcolatore vero per fisica/matematica (2026-11-23) ───────────────────────────────────────────
+// Il modello scrive UNA espressione numerica; la valuta questo parser (niente eval: l'Edge runtime lo vieta e sarebbe pericoloso).
+function calcEval(src) {
+  const str = String(src || '').replace(/\s+/g, '').replace(/,/g, '.').replace(/×|·|⋅/g, '*').replace(/−/g, '-').replace(/\^/g, '**').replace(/Math\./g, '');
+  let i = 0;
+  const FN = { sqrt: Math.sqrt, sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan, log: Math.log, ln: Math.log, log10: Math.log10, exp: Math.exp, abs: Math.abs, cbrt: Math.cbrt };
+  function peek() { return str[i]; }
+  function num() {
+    const m = /^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/.exec(str.slice(i));
+    if (!m) throw new Error('num');
+    i += m[0].length; return parseFloat(m[0]);
+  }
+  function atom() {
+    if (peek() === '(') { i++; const v = expr(); if (peek() !== ')') throw new Error(')'); i++; return v; }
+    if (peek() === '-') { i++; return -pow(); }
+    if (peek() === '+') { i++; return pow(); }
+    const id = /^[A-Za-z][A-Za-z0-9]*/.exec(str.slice(i));
+    if (id) {
+      const name = id[0]; i += name.length;
+      if (name === 'PI' || name === 'pi') return Math.PI;
+      if (name === 'E') return Math.E;
+      if (name === 'pow') { i++; const a = expr(); if (peek() !== ',' && peek() !== ';') throw new Error('pow'); i++; const b = expr(); if (peek() !== ')') throw new Error(')'); i++; return Math.pow(a, b); }
+      if (FN[name] && peek() === '(') { i++; const v = expr(); if (peek() !== ')') throw new Error(')'); i++; return FN[name](v); }
+      throw new Error('id ' + name);
+    }
+    return num();
+  }
+  function pow() { let b = atom(); if (str.slice(i, i + 2) === '**') { i += 2; const e = pow(); b = Math.pow(b, e); } return b; }
+  function term() { let v = pow(); for (;;) { const c = peek(); if (c === '*' && str[i + 1] !== '*') { i++; v *= pow(); } else if (c === '/') { i++; v /= pow(); } else return v; } }
+  function expr() { let v = term(); for (;;) { const c = peek(); if (c === '+') { i++; v += term(); } else if (c === '-') { i++; v -= term(); } else return v; } }
+  const v = expr();
+  if (i !== str.length || !isFinite(v)) throw new Error('fine');
+  return v;
+}
+const CALC_SYS = 'Sei un calcolatore. Leggi il problema di fisica o matematica e scrivi UNA SOLA espressione numerica che dà il risultato finale richiesto, già convertito nell\'unità chiesta dal testo (se il testo dice "in cm" l\'espressione dà centimetri; "in kV" dà kilovolt). Usa solo numeri (anche 1.6e-19), + - * / ** , parentesi e le funzioni sqrt, sin, cos, tan, asin, acos, atan, log, log10, exp, abs, PI. Gli angoli per sin/cos/tan sono in radianti: per i gradi scrivi (30*PI/180). Usa le costanti e i valori forniti dal testo; se non ci sono usa g=9.8. Non usare variabili. Se il problema non ha un risultato numerico unico rispondi esattamente NONE. Rispondi SOLO con l\'espressione, nessun testo.';
+async function calcPrepass(providers, userText, model) {
+  try {
+    const r = await callWithFallback(providers, [{ role: 'system', content: CALC_SYS }, { role: 'user', content: String(userText).slice(0, 1500) }], 250, 0, model);
+    let t = String(r.text || '').trim().replace(/^```\w*\n?|```$/g, '').trim().split('\n').filter(l => l.trim())[0] || '';
+    t = t.replace(/^[A-Za-zµμ_ ]*=\s*/, '');
+    if (!t || /^none$/i.test(t)) return null;
+    const v = calcEval(t);
+    return { value: v, expr: t, provider: r.provider };
+  } catch (e) { console.log('[calc] prepass non riuscito: ' + (e && e.message)); return null; }
+}
+function fmtCalc(v) { const a = Math.abs(v); if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(4).replace('e', ' · 10^').replace('+', ''); return String(Number(v.toPrecision(5))); }
 const CINEMA_NOTE = '\n\nPROGRAMMAZIONE (cinema, teatro, concerti, spettacoli): elenca SOLO titoli, sale e orari che compaiono nei [RISULTATI WEB] per la data richiesta. Non usare la memoria: i film in sala cambiano ogni settimana e quelli che ricordi sono quasi sempre vecchi. Non scrivere indirizzi, orari o nomi di sale che i risultati non riportano. Se i risultati non contengono la programmazione di quel giorno e di quella città, dillo in una riga e dai SOLO i link mymovies.it e comingsoon.it. Non nominare sale o cinema specifici e non scrivere indirizzi web di singoli cinema che non compaiono nei risultati (li hai inventati a memoria in passato). Se i risultati riportano film di un altro paese (per esempio siti francesi), ignorali. Cita ogni fonte con il suo nome.';
 function geoEnrich(text, req) {
   try {
@@ -2236,7 +2283,7 @@ async function handlerCore(req) {
   const sccNote = (scc && scc.connected && scc.topic)
     ? '\n\nNota di sistema: questa è la PROSECUZIONE della stessa conversazione, argomento: "' + scc.topic.replace(/["\n]/g, ' ') + '". Il nuovo messaggio va interpretato nel contesto di questo argomento (e degli eventuali allegati già forniti): non cambiare tema e non rispondere come a una domanda isolata. Se il messaggio è ambiguo, scegli il significato coerente con l\'argomento.'
     : '';
-  const realDateNoteFull = realDateNote + genderNote(_intent, messages, userText) + helpNote(_intent, messages, userText) + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '') + (PHYS_RE.test(String(userText || '')) ? PHYS_NOTE : '');
+  const realDateNoteFull = (PHYS_RE.test(String(userText || '')) ? realDateNote.replace(/\n\nNota di sistema: il sito NON supporta la notazione matematica LaTeX[^\n]*$/, '') : realDateNote) + genderNote(_intent, messages, userText) + helpNote(_intent, messages, userText) + sccNote + FREQ_REQ_NOTE + ipPlaceNote(req, userText) + webCapNote + guideNote(messages, userText) + newsWriteNote(userText) + glossNote(userText) + dateNote(userText) + (TRANS_RE.test(String(userText || '')) ? TRANS_NOTE : '') + (CINEMA_RE.test(String(userText || '')) ? CINEMA_NOTE : '') + (PHYS_RE.test(String(userText || '')) ? PHYS_NOTE : '');
   {
     const dateIdx = messages.findIndex(m => m.role === 'system');
     if (dateIdx >= 0) messages[dateIdx] = { ...messages[dateIdx], content: messages[dateIdx].content + '\n\n' + realDateNoteFull };
@@ -2910,6 +2957,23 @@ async function handlerCore(req) {
   try {
     const readable = makeSSE(async (send) => {
       send({ type: 'meta', webSearchUsed: shouldSearch && !!webCtx });
+      // 2026-11-23: fisica/matematica -> motori forti per primi (Groq gpt-oss-120b con ragionamento alto, Cloudflare, SambaNova, Mistral), Gemini (anche flash-lite) e OpenRouter restano come riserva;
+      // poi un calcolatore vero scrive il risultato numerico e il modello deve coincidere.
+      let providersRun = providers;
+      if (PHYS_RE.test(String(userText || '')) && /\d/.test(String(userText || '')) && !messagesHaveImage(messages)) {
+        const RANK = { Groq: 0, Cloudflare: 1, SambaNova: 2, Mistral: 3, OpenRouter: 4, Gemini: 5 };
+        providersRun = providers.map(p => p.name === 'Groq' ? { ...p, extraBody: { ...(p.extraBody || {}), reasoning_effort: 'high' } } : p)
+          .sort((a, b) => (RANK[a.name] ?? 9) - (RANK[b.name] ?? 9));
+        const calc = await calcPrepass(providersRun, userText, smartModel);
+        if (calc) {
+          console.log('[calc] ' + calc.expr + ' = ' + calc.value + ' (' + calc.provider + ')');
+          const note = '\n\nRISULTATO NUMERICO DA CALCOLATORE (verificato, aritmetica esatta): ' + fmtCalc(calc.value) + ' nell\'unità richiesta dal testo. Il risultato finale della tua risposta deve coincidere con questo valore (arrotondato in modo ragionevole): imposta i passaggi in modo coerente e controlla le unità. Se il valore ti sembra incompatibile con la fisica del problema, ricontrolla i dati prima di scriverlo.';
+          const si = finalMsgs.findIndex(m => m.role === 'system');
+          if (si !== -1) finalMsgs[si] = { ...finalMsgs[si], content: finalMsgs[si].content + note };
+          else finalMsgs.unshift({ role: 'system', content: note.trim() });
+          providersRun.__calc = calc.value;
+        }
+      }
       // 2026-10-24 (correzione dal test «12 lezioni da 6 slide»): se la risposta viene tagliata dal limite di token
       // (finish_reason 'length' -> 'truncated') AInstAIn riprende da solo, nella stessa bolla, fino a AUTO_CONTINUE_MAX volte
       // (default 3). Prima l'utente doveva scrivere «continua» a mano più volte. Alla ripresa si rimandano solo il sistema,
@@ -2926,7 +2990,7 @@ async function handlerCore(req) {
             { role: 'assistant', content: acc.slice(-4000) },
             { role: 'user', content: 'La tua risposta si è interrotta per il limite di lunghezza. Riprendi ESATTAMENTE dal punto in cui ti sei fermato (anche a metà frase), senza ripetere nulla di ciò che hai già scritto, senza introduzioni e senza scusarti. Mantieni lo stesso formato e la stessa lingua, e completa tutto ciò che la richiesta iniziale chiedeva.' }];
         }
-        const _runStream = () => streamWithFallback(providers, msgs, maxTokens, temperature, smartModel,
+        const _runStream = () => streamWithFallback(providersRun, msgs, maxTokens, temperature, smartModel,
           tok => { acc += tok; send({ type: 'token', token: tok }); },
           // FIX 2026-09-19: propaga quale modello/provider ha risposto davvero (tag discreto in UI e diagnosi senza aprire i log)
           (r, i) => { reason = r; info = i; }
