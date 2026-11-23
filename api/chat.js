@@ -2964,7 +2964,7 @@ async function handlerCore(req) {
         const RANK = { Groq: 0, Cloudflare: 1, SambaNova: 2, Mistral: 3, OpenRouter: 4, Gemini: 5 };
         providersRun = providers.map(p => p.name === 'Groq' ? { ...p, extraBody: { ...(p.extraBody || {}), reasoning_effort: 'high' } } : p)
           .sort((a, b) => (RANK[a.name] ?? 9) - (RANK[b.name] ?? 9));
-        const calc = await calcPrepass(providersRun, userText, smartModel);
+        const calc = await Promise.race([calcPrepass(providersRun, userText, smartModel), new Promise(r => setTimeout(() => r(null), 7000))]); // al massimo 7 s di attesa per il calcolatore
         if (calc) {
           console.log('[calc] ' + calc.expr + ' = ' + calc.value + ' (' + calc.provider + ')');
           const note = '\n\nRISULTATO NUMERICO DA CALCOLATORE (verificato, aritmetica esatta): ' + fmtCalc(calc.value) + ' nell\'unità richiesta dal testo. Il risultato finale della tua risposta deve coincidere con questo valore (arrotondato in modo ragionevole): imposta i passaggi in modo coerente e controlla le unità. Se il valore ti sembra incompatibile con la fisica del problema, ricontrolla i dati prima di scriverlo.';
